@@ -1,0 +1,329 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+SOURCE_PATH="${BASH_SOURCE[0]}"
+while [[ -L "$SOURCE_PATH" ]]; do
+  SOURCE_DIR="$(cd -P -- "$(dirname -- "$SOURCE_PATH")" && pwd)"
+  SOURCE_PATH="$(readlink -- "$SOURCE_PATH")"
+  [[ "$SOURCE_PATH" != /* ]] && SOURCE_PATH="$SOURCE_DIR/$SOURCE_PATH"
+done
+
+SCRIPT_DIR="$(cd -P -- "$(dirname -- "$SOURCE_PATH")" && pwd)"
+readonly SCRIPT_DIR
+ROOT_DIR="${OFFENSIVECTL_ROOT:-$(cd "$SCRIPT_DIR/.." && pwd -P)}"
+readonly ROOT_DIR
+readonly OFFENSIVECTL="$ROOT_DIR/offensivectl"
+
+DEFAULT_MODULES=(
+  "dns.whois_lookup"
+  "dns.dig_dns"
+  "dns.amass_passive"
+  "dns.subfinder"
+  "osint.waybackurls"
+  "osint.theharvester"
+)
+
+STAGE="full"
+INPUT_FILE=""
+CASE_ID=""
+AUTHORIZATION=""
+SCOPE_FILE=""
+DRY_RUN=false
+VERBOSE=false
+TARGETS=()
+MODULES=()
+
+usage() {
+  cat <<USAGE
+Usage:
+  offensive-osint-scope [full|collect] --input FILE --case CASE-ID --authorization TOKEN [options]
+  offensive-osint-scope [full|collect] --target DOMAIN --case CASE-ID --authorization TOKEN [options]
+
+Runs the maintained passive DNS/OSINT modules for each domain in a scope file.
+
+Required:
+  --case CASE-ID            Case identifier used under reports/
+  --authorization TOKEN     Authorization marker recorded by each module
+  --input FILE              Scope/input file with domains, or use --target
+  --target DOMAIN           Single domain target, or use --input
+
+Options:
+  --module MODULE           Override modules; repeat for multiple modules
+  --scope FILE              Optional module scope file
+  --dry-run                 Print planned commands without running modules
+  -v, --verbose             Pass verbose mode to modules
+  -h, --help                Show this help
+
+Input lines may be plain domains, domain:<domain>, or url:<url>.
+Comments, blank lines, email:<value>, and user:<value> entries are ignored.
+USAGE
+}
+
+log() {
+  printf '[osint-scope] %s\n' "$*"
+}
+
+die() {
+  printf '[osint-scope] ERROR: %s\n' "$*" >&2
+  exit 1
+}
+
+trim_line() {
+  sed -E 's/^[[:space:]]+//; s/[[:space:]]+$//'
+}
+
+normalize_target() {
+  local raw="$1"
+  local value
+
+  value="$(printf '%s' "$raw" | trim_line)"
+  value="${value%%#*}"
+  value="$(printf '%s' "$value" | trim_line)"
+  [[ -n "$value" ]] || return 1
+
+  case "$value" in
+    domain:*)
+      value="${value#domain:}"
+      ;;
+    url:*)
+      value="${value#url:}"
+      value="${value#http://}"
+      value="${value#https://}"
+      value="${value%%/*}"
+      ;;
+    email:*|user:*)
+      return 1
+      ;;
+    *:*)
+      return 1
+      ;;
+  esac
+
+  value="$(printf '%s' "$value" | trim_line)"
+  [[ -n "$value" ]] || return 1
+  [[ "$value" =~ ^[A-Za-z0-9._-]+$ ]] || return 1
+
+  printf '%s\n' "$value"
+}
+
+add_input_targets() {
+  local input_path="$1"
+  local line
+  local target
+
+  [[ -f "$input_path" ]] || die "input file not found: $input_path"
+
+  while IFS= read -r line || [[ -n "$line" ]]; do
+    if target="$(normalize_target "$line")"; then
+      TARGETS+=("$target")
+    fi
+  done < "$input_path"
+}
+
+format_cmd() {
+  local part
+  for part in "$@"; do
+    printf '%q ' "$part"
+  done
+}
+
+write_manifest() {
+  local manifest_file="$1"
+  local run_id="$2"
+  local run_dir="$3"
+  local command_count="$4"
+  local failure_count="$5"
+
+  cat > "$manifest_file" <<JSON
+{
+  "run_id": "$run_id",
+  "stage": "$STAGE",
+  "case_id": "$CASE_ID",
+  "input": "$INPUT_FILE",
+  "targets": ${#TARGETS[@]},
+  "modules": ${#MODULES[@]},
+  "planned_commands": $command_count,
+  "failures": $failure_count,
+  "dry_run": $DRY_RUN,
+  "generated_at": "$(date -Iseconds)",
+  "export_dir": "$run_dir"
+}
+JSON
+}
+
+parse_args() {
+  if [[ $# -gt 0 ]]; then
+    case "$1" in
+      full|collect)
+        STAGE="$1"
+        shift
+        ;;
+      -h|--help)
+        usage
+        exit 0
+        ;;
+    esac
+  fi
+
+  while [[ $# -gt 0 ]]; do
+    case "$1" in
+      --input|-i)
+        INPUT_FILE="${2:-}"
+        shift 2
+        ;;
+      --target|-t)
+        TARGETS+=("${2:-}")
+        shift 2
+        ;;
+      --case)
+        CASE_ID="${2:-}"
+        shift 2
+        ;;
+      --authorization|--auth)
+        AUTHORIZATION="${2:-}"
+        shift 2
+        ;;
+      --scope)
+        SCOPE_FILE="${2:-}"
+        shift 2
+        ;;
+      --module)
+        MODULES+=("${2:-}")
+        shift 2
+        ;;
+      --dry-run)
+        DRY_RUN=true
+        shift
+        ;;
+      -v|--verbose)
+        VERBOSE=true
+        shift
+        ;;
+      -h|--help)
+        usage
+        exit 0
+        ;;
+      *)
+        die "unknown option: $1"
+        ;;
+    esac
+  done
+}
+
+main() {
+  parse_args "$@"
+
+  [[ -n "$CASE_ID" ]] || die "--case CASE-ID is required"
+  [[ -n "$AUTHORIZATION" ]] || die "--authorization TOKEN is required"
+  [[ -x "$OFFENSIVECTL" ]] || die "offensivectl not executable: $OFFENSIVECTL"
+
+  if [[ -n "$INPUT_FILE" ]]; then
+    local input_path="$INPUT_FILE"
+    [[ "$input_path" = /* ]] || input_path="$ROOT_DIR/$input_path"
+    add_input_targets "$input_path"
+  fi
+
+  [[ "${#TARGETS[@]}" -gt 0 ]] || die "no domain targets found"
+
+  if [[ "${#MODULES[@]}" -eq 0 ]]; then
+    MODULES=("${DEFAULT_MODULES[@]}")
+  fi
+
+  mkdir -p "$ROOT_DIR/outputs/runs"
+  local run_id
+  local run_dir
+  local command_file
+  local run_log
+  local summary_file
+  local manifest_file
+  run_id="osint-scope-${CASE_ID}-$(date +%Y%m%d-%H%M%S)-$$"
+  run_dir="$ROOT_DIR/outputs/runs/$run_id"
+  command_file="$run_dir/commands.tsv"
+  run_log="$run_dir/run.log"
+  summary_file="$run_dir/summary.md"
+  manifest_file="$run_dir/run_manifest.json"
+  mkdir -p "$run_dir"
+
+  printf 'target\tmodule\tstatus\tcommand\n' > "$command_file"
+  : > "$run_log"
+
+  local command_count=0
+  local failure_count=0
+  local target
+  local module
+  local status
+
+  log "case: $CASE_ID"
+  log "targets: ${#TARGETS[@]}"
+  log "modules: ${#MODULES[@]}"
+  log "run dir: $run_dir"
+
+  for target in "${TARGETS[@]}"; do
+    target="$(normalize_target "$target")" || continue
+
+    for module in "${MODULES[@]}"; do
+      local cmd=(
+        "bash"
+        "$OFFENSIVECTL"
+        "run"
+        "$module"
+        "--case"
+        "$CASE_ID"
+        "--target"
+        "$target"
+        "--authorization"
+        "$AUTHORIZATION"
+      )
+
+      [[ -n "$SCOPE_FILE" ]] && cmd+=("--scope" "$SCOPE_FILE")
+      [[ "$VERBOSE" == "true" ]] && cmd+=("--verbose")
+
+      command_count=$((command_count + 1))
+
+      if [[ "$DRY_RUN" == "true" ]]; then
+        status="planned"
+        format_cmd "${cmd[@]}" | tee -a "$run_log"
+        printf '\n' | tee -a "$run_log"
+      elif "${cmd[@]}" >> "$run_log" 2>&1; then
+        status="completed"
+      else
+        status="failed"
+        failure_count=$((failure_count + 1))
+      fi
+
+      {
+        printf '%s\t%s\t%s\t' "$target" "$module" "$status"
+        format_cmd "${cmd[@]}"
+        printf '\n'
+      } >> "$command_file"
+    done
+  done
+
+  {
+    printf '# OSINT Scope Run\n\n'
+    printf '**Case:** %s\n' "$CASE_ID"
+    printf '**Stage:** %s\n' "$STAGE"
+    printf '**Dry run:** %s\n' "$DRY_RUN"
+    printf '**Targets:** %s\n' "${#TARGETS[@]}"
+    printf '**Modules:** %s\n' "${#MODULES[@]}"
+    printf '**Commands:** %s\n' "$command_count"
+    printf '**Failures:** %s\n\n' "$failure_count"
+    printf '## Files\n'
+    printf '%s\n' '- Commands: commands.tsv'
+    printf '%s\n' '- Log: run.log'
+    printf '%s\n' '- Manifest: run_manifest.json'
+  } > "$summary_file"
+
+  write_manifest "$manifest_file" "$run_id" "$run_dir" "$command_count" "$failure_count"
+
+  if [[ "$DRY_RUN" == "true" ]]; then
+    log "dry run complete"
+  elif [[ "$failure_count" -gt 0 ]]; then
+    log "complete with failures: $failure_count"
+    exit 1
+  else
+    log "complete"
+  fi
+}
+
+main "$@"

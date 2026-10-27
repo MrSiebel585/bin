@@ -1,0 +1,122 @@
+#!/usr/bin/env bash
+set -Eeuo pipefail
+
+ACTION_DIR="${OFFENSIVECTL_MENU_ACTIONS:-/opt/offensive/bin}"
+
+die() { printf 'ERROR: %s\n' "$*" >&2; exit 1; }
+
+read_meta() {
+    local file="$1" key="$2"
+    sed -n "s/^# ${key}=//p" "$file" | head -n 1
+}
+
+is_trusted_action() {
+    local file="$1" mode owner resolved
+    [[ -f "$file" && -x "$file" && ! -L "$file" ]] || return 1
+    resolved="$(realpath -e -- "$file" 2>/dev/null)" || return 1
+    [[ "$(dirname -- "$resolved")" == "$(realpath -e -- "$ACTION_DIR")" ]] || return 1
+    owner="$(stat -c '%u' -- "$file")" || return 1
+    [[ "$owner" == 0 ]] || return 1
+    mode="$(stat -c '%a' -- "$file")" || return 1
+    # Refuse group- or world-writable actions.
+    (( (8#$mode & 0022) == 0 )) || return 1
+}
+
+discover_actions() {
+    local file
+    shopt -s nullglob
+    for file in "$ACTION_DIR"/offensivectl-menu-*; do
+        is_trusted_action "$file" && printf '%s\0' "$file"
+    done | sort -z
+}
+
+list_actions() {
+    local file label description risk
+    while IFS= read -r -d '' file; do
+        label="$(read_meta "$file" MENU_LABEL)"
+        description="$(read_meta "$file" MENU_DESCRIPTION)"
+        risk="$(read_meta "$file" MENU_RISK)"
+        [[ -n "$label" ]] || label="$(basename -- "$file" | sed 's/^offensivectl-menu-//; s/-/ /g')"
+        [[ -n "$risk" ]] || risk="low"
+        printf '%-30s [%s]\n' "$label" "$risk"
+        [[ -z "$description" ]] || printf '  %s\n' "$description"
+    done < <(discover_actions)
+}
+
+case "${1:-}" in
+    --help|-h)
+        cat <<'HELP_EOF'
+Usage:
+  offensivectl menu             Open the dynamically discovered action menu
+  offensivectl menu list        List trusted menu actions
+  offensivectl menu --help      Show this help
+
+Add an item by installing a root-owned, non-writable executable named
+offensivectl-menu-NAME in /opt/offensive/bin. Put MENU_LABEL, optional
+MENU_DESCRIPTION, and optional MENU_RISK metadata in its leading comments.
+HELP_EOF
+        exit 0
+        ;;
+    list)
+        list_actions
+        exit 0
+        ;;
+    "") ;;
+    *) die "Unknown menu option: $1" ;;
+esac
+
+[[ -d "$ACTION_DIR" ]] || die "Menu action directory not found: $ACTION_DIR"
+
+while :; do
+    mapfile -d '' -t actions < <(discover_actions)
+    printf '\nOffensivectl Dynamic Menu\n'
+    printf '%s\n' '========================='
+    if ((${#actions[@]} == 0)); then
+        printf 'No trusted actions found in %s\n' "$ACTION_DIR"
+    else
+        for i in "${!actions[@]}"; do
+            file="${actions[$i]}"
+            label="$(read_meta "$file" MENU_LABEL)"
+            description="$(read_meta "$file" MENU_DESCRIPTION)"
+            risk="$(read_meta "$file" MENU_RISK)"
+            [[ -n "$label" ]] || label="$(basename -- "$file" | sed 's/^offensivectl-menu-//; s/-/ /g')"
+            [[ -n "$risk" ]] || risk="low"
+            printf ' %2d) %s [%s]\n' "$((i + 1))" "$label" "$risk"
+            [[ -z "$description" ]] || printf '     %s\n' "$description"
+        done
+    fi
+    printf '  q) Quit\n\nSelect an item: '
+    IFS= read -r choice || exit 0
+    [[ "$choice" == q || "$choice" == Q ]] && exit 0
+    [[ "$choice" =~ ^[0-9]+$ ]] || { printf 'Choose a listed number or q.\n'; continue; }
+    (( choice >= 1 && choice <= ${#actions[@]} )) || { printf 'Selection is out of range.\n'; continue; }
+
+    selected="${actions[$((choice - 1))]}"
+    # Revalidate immediately before execution in case the registry changed.
+    is_trusted_action "$selected" || die "Selected action failed trust checks: $selected"
+    risk="$(read_meta "$selected" MENU_RISK)"
+    case "${risk:-low}" in
+        low|informational) ;;
+        medium)
+            printf 'This action is marked medium risk. Type RUN to continue: '
+            IFS= read -r confirm
+            [[ "$confirm" == RUN ]] || { printf 'Cancelled.\n'; continue; }
+            ;;
+        high|active)
+            printf 'This action is marked %s risk. Confirm authorization and type RUN-AUTHORIZED: ' "$risk"
+            IFS= read -r confirm
+            [[ "$confirm" == RUN-AUTHORIZED ]] || { printf 'Cancelled.\n'; continue; }
+            ;;
+        *) die "Invalid MENU_RISK metadata in $selected" ;;
+    esac
+    printf '\nRunning: %s\n\n' "$(read_meta "$selected" MENU_LABEL)"
+    if "$selected"; then
+        status=0
+    else
+        status=$?
+    fi
+    printf '\nAction exit status: %d\n' "$status"
+    printf 'Press Enter to return to the menu, or q to quit: '
+    IFS= read -r after || exit 0
+    [[ "$after" == q || "$after" == Q ]] && exit 0
+done

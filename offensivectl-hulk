@@ -1,0 +1,89 @@
+#!/usr/bin/env zsh
+
+set -u
+
+ROOT="/opt/offensive"
+HULK="$ROOT/vendors/source/HULK-v3"
+VENV="$ROOT/venvs/hulk"
+PYTHON="$VENV/bin/python"
+
+case "${1:-help}" in
+
+    status)
+        echo "HULK-v3 integration"
+        echo "-------------------"
+        echo "Source: $HULK"
+        echo "Python: $PYTHON"
+        echo
+
+        [[ -d "$HULK/.git" ]] \
+            && echo "[+] repository installed" \
+            || echo "[-] repository missing"
+
+        [[ -x "$PYTHON" ]] \
+            && echo "[+] virtualenv ready" \
+            || echo "[-] virtualenv missing"
+        ;;
+
+    version)
+        git -C "$HULK" \
+            log -1 \
+            --pretty='commit: %H%ncommit-date: %ci%nsubject: %s'
+        ;;
+
+    files)
+        find "$HULK" \
+            -maxdepth 2 \
+            -type f \
+            | sort
+        ;;
+
+    # OFFENSIVECTL_HULK_LAUNCH
+    launch)
+        cd "$HULK" || exit 1
+        exec "$PYTHON" "$HULK/hulk_launcher.py"
+        ;;
+
+    inspect)
+        echo "== launcher help =="
+        "$PYTHON" "$HULK/hulk_launcher.py" --help 2>&1 || true
+        ;;
+
+    dependencies)
+        "$VENV/bin/pip" list
+        ;;
+
+    update)
+        echo "[+] Updating upstream source..."
+        sudo git -C "$HULK" pull --ff-only
+        ;;
+
+    source)
+        cd "$HULK" || exit 1
+        exec "${SHELL:-/bin/zsh}"
+        ;;
+
+    help|*)
+        cat <<'HELP'
+
+offensivectl hulk
+
+Lab/research integration for HULK-v3.
+
+Commands:
+
+  offensivectl hulk status
+  offensivectl hulk version
+  offensivectl hulk files
+  offensivectl hulk inspect
+  offensivectl hulk launch
+  offensivectl hulk dependencies
+  offensivectl hulk source
+  offensivectl hulk update
+
+The wrapper intentionally does not expose arbitrary-target
+DDoS execution.
+
+HELP
+        ;;
+esac

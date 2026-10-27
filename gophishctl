@@ -1,0 +1,625 @@
+#!/usr/bin/env zsh
+
+set -euo pipefail
+
+# ============================================================
+# gophishctl
+# Authorized GoPhish laboratory / awareness controller
+# ============================================================
+
+CONFIG_DIR="${HOME}/.config/gophishctl"
+CONFIG_FILE="${CONFIG_DIR}/config.zsh"
+REPORT_DIR="${HOME}/gophish-reports"
+
+mkdir -p "$CONFIG_DIR" "$REPORT_DIR"
+
+# ------------------------------------------------------------
+# Helpers
+# ------------------------------------------------------------
+
+die() {
+    echo "[ERROR] $*" >&2
+    exit 1
+}
+
+need_cmd() {
+    command -v "$1" >/dev/null 2>&1 || die "Required command not found: $1"
+}
+
+load_config() {
+    if [[ -f "$CONFIG_FILE" ]]; then
+        source "$CONFIG_FILE"
+    fi
+
+    GOPHISH_URL="${GOPHISH_URL:-https://127.0.0.1:3333}"
+    LAB_PUBLIC_URL="${LAB_PUBLIC_URL:-http://192.168.0.126}"
+}
+
+require_api_key() {
+    [[ -n "${GOPHISH_API_KEY:-}" ]] || {
+        echo "[ERROR] GOPHISH_API_KEY is not configured."
+        echo
+        echo "Run:"
+        echo "  gophishctl configure"
+        exit 1
+    }
+}
+
+api_get() {
+    local endpoint="$1"
+
+    curl -ksS \
+        -H "Authorization: ${GOPHISH_API_KEY}" \
+        -H "Accept: application/json" \
+        "${GOPHISH_URL}${endpoint}"
+}
+
+api_post() {
+    local endpoint="$1"
+    local payload="$2"
+
+    curl -ksS \
+        -X POST \
+        -H "Authorization: ${GOPHISH_API_KEY}" \
+        -H "Content-Type: application/json" \
+        -H "Accept: application/json" \
+        --data "$payload" \
+        "${GOPHISH_URL}${endpoint}"
+}
+
+banner() {
+    echo "=============================================="
+    echo " GOPHISHCTL"
+    echo " Authorized Awareness Lab Controller"
+    echo "=============================================="
+}
+
+# ------------------------------------------------------------
+# configure
+# ------------------------------------------------------------
+
+cmd_configure() {
+
+    banner
+    echo
+
+    read "api_url?GoPhish admin API [https://127.0.0.1:3333]: "
+    api_url="${api_url:-https://127.0.0.1:3333}"
+
+    read "public_url?Campaign URL [http://192.168.0.126]: "
+    public_url="${public_url:-http://192.168.0.126}"
+
+    echo -n "GoPhish API key: "
+    read -s api_key
+    echo
+
+    [[ -n "$api_key" ]] || die "API key cannot be empty."
+
+    cat > "$CONFIG_FILE" <<EOF
+GOPHISH_URL="${api_url}"
+GOPHISH_API_KEY="${api_key}"
+LAB_PUBLIC_URL="${public_url}"
+EOF
+
+    chmod 600 "$CONFIG_FILE"
+
+    echo
+    echo "[OK] Configuration saved:"
+    echo "$CONFIG_FILE"
+}
+
+# ------------------------------------------------------------
+# status
+# ------------------------------------------------------------
+
+cmd_status() {
+
+    require_api_key
+
+    echo "=== GoPhish ==="
+    echo "API:      $GOPHISH_URL"
+    echo "Campaign: $LAB_PUBLIC_URL"
+    echo
+
+    if curl -ksS \
+        --connect-timeout 4 \
+        -H "Authorization: ${GOPHISH_API_KEY}" \
+        "${GOPHISH_URL}/api/campaigns/" \
+        >/dev/null
+    then
+        echo "[OK] GoPhish API reachable."
+    else
+        die "Unable to reach GoPhish API."
+    fi
+
+    echo
+    echo "=== Local service ==="
+
+    pgrep -af gophish || true
+
+    echo
+    echo "=== Listeners ==="
+
+    sudo ss -lntp |
+        grep -E ':(80|443|3333)\b' ||
+        true
+}
+
+# ------------------------------------------------------------
+# list
+# ------------------------------------------------------------
+
+cmd_list() {
+
+    require_api_key
+
+    local type="${1:-}"
+
+    case "$type" in
+
+        groups)
+            api_get "/api/groups/" |
+                jq -r '.[] | "\(.id)\t\(.name)\t\(.targets | length) recipients"'
+            ;;
+
+        templates)
+            api_get "/api/templates/" |
+                jq -r '.[] | "\(.id)\t\(.name)\t\(.subject)"'
+            ;;
+
+        pages)
+            api_get "/api/pages/" |
+                jq -r '.[] | "\(.id)\t\(.name)"'
+            ;;
+
+        profiles)
+            api_get "/api/smtp/" |
+                jq -r '.[] | "\(.id)\t\(.name)\t\(.host)\t\(.from_address)"'
+            ;;
+
+        campaigns)
+            api_get "/api/campaigns/" |
+                jq -r '.[] | "\(.id)\t\(.status)\t\(.name)"'
+            ;;
+
+        *)
+            die "Usage: gophishctl list groups|templates|pages|profiles|campaigns"
+            ;;
+    esac
+}
+
+# ------------------------------------------------------------
+# CSV -> group
+#
+# Required CSV:
+# email,first_name,last_name,position
+# ------------------------------------------------------------
+
+cmd_group_import() {
+
+    require_api_key
+
+    local csv="${1:-}"
+    local group="${2:-}"
+
+    [[ -f "$csv" ]] ||
+        die "CSV not found: $csv"
+
+    [[ -n "$group" ]] ||
+        die "Group name required."
+
+    echo "[INFO] Importing:"
+    echo "  CSV:   $csv"
+    echo "  Group: $group"
+
+    local targets
+
+    targets="$(
+        awk -F',' '
+        NR > 1 {
+            gsub(/\r/, "", $0)
+            printf "%s\t%s\t%s\t%s\n", $1, $2, $3, $4
+        }
+        ' "$csv" |
+        jq -R -s '
+            split("\n")
+            | map(select(length > 0))
+            | map(
+                split("\t") |
+                {
+                    email: .[0],
+                    first_name: (.[1] // ""),
+                    last_name: (.[2] // ""),
+                    position: (.[3] // "")
+                }
+            )
+        '
+    )"
+
+    local count
+
+    count="$(echo "$targets" | jq 'length')"
+
+    (( count > 0 )) ||
+        die "No recipients found."
+
+    echo "[INFO] $count recipients detected."
+
+    local payload
+
+    payload="$(
+        jq -n \
+            --arg name "$group" \
+            --argjson targets "$targets" \
+            '{
+                name: $name,
+                targets: $targets
+            }'
+    )"
+
+    echo
+    echo "[INFO] Creating group..."
+
+    api_post "/api/groups/" "$payload" |
+        jq .
+
+    echo
+    echo "[OK] Group submitted."
+}
+
+# ------------------------------------------------------------
+# campaign inspect
+# ------------------------------------------------------------
+
+cmd_results() {
+
+    require_api_key
+
+    local id="${1:-}"
+
+    [[ "$id" == <-> ]] ||
+        die "Campaign ID required."
+
+    local outfile="${REPORT_DIR}/campaign-${id}.json"
+
+    api_get "/api/campaigns/${id}" |
+        tee "$outfile" |
+        jq '{
+            id,
+            name,
+            status,
+            created_date,
+            launch_date,
+            completed_date,
+            url,
+            results,
+            timeline
+        }'
+
+    echo
+    echo "[OK] Raw results:"
+    echo "$outfile"
+}
+
+# ------------------------------------------------------------
+# summary
+# ------------------------------------------------------------
+
+cmd_report() {
+
+    require_api_key
+
+    local id="${1:-}"
+
+    [[ "$id" == <-> ]] ||
+        die "Campaign ID required."
+
+    local json
+    json="$(api_get "/api/campaigns/${id}")"
+
+    local report="${REPORT_DIR}/campaign-${id}-summary.txt"
+
+    {
+        echo "=============================================="
+        echo " GOPHISH AUTHORIZED TRAINING REPORT"
+        echo "=============================================="
+        echo
+
+        echo "$json" |
+            jq -r '
+                "Campaign:    \(.name)",
+                "ID:          \(.id)",
+                "Status:      \(.status)",
+                "URL:         \(.url)",
+                "",
+                "Recipients:  \(.results | length)"
+            '
+
+        local sent
+        local opened
+        local clicked
+        local submitted
+
+        sent="$(
+            echo "$json" |
+                jq '[.timeline[]? | select(.message == "Email Sent")] | length'
+        )"
+
+        opened="$(
+            echo "$json" |
+                jq '[.timeline[]? | select(.message == "Email Opened")] | length'
+        )"
+
+        clicked="$(
+            echo "$json" |
+                jq '[.timeline[]? | select(.message == "Clicked Link")] | length'
+        )"
+
+        submitted="$(
+            echo "$json" |
+                jq '[.timeline[]? | select(.message == "Submitted Data")] | length'
+        )"
+
+        echo "Sent:        $sent"
+        echo "Opened:      $opened"
+        echo "Clicked:     $clicked"
+        echo "Submitted:   $submitted"
+
+        echo
+        echo "Generated:   $(date)"
+
+    } | tee "$report"
+
+    echo
+    echo "[OK] Report written:"
+    echo "$report"
+}
+
+# ------------------------------------------------------------
+# campaign launch
+#
+# Objects are referenced by NAME, matching GoPhish API behavior.
+# ------------------------------------------------------------
+
+cmd_campaign_launch() {
+
+    require_api_key
+
+    local name="${1:-}"
+    local template="${2:-}"
+    local page="${3:-}"
+    local profile="${4:-}"
+    local group="${5:-}"
+
+    [[ -n "$name" ]]     || die "Campaign name required."
+    [[ -n "$template" ]] || die "Template name required."
+    [[ -n "$page" ]]     || die "Landing page name required."
+    [[ -n "$profile" ]]  || die "Sending profile name required."
+    [[ -n "$group" ]]    || die "Group name required."
+
+    echo
+    echo "=============================================="
+    echo " CAMPAIGN REVIEW"
+    echo "=============================================="
+    echo
+    echo "Name:             $name"
+    echo "Template:         $template"
+    echo "Landing page:     $page"
+    echo "Sending profile:  $profile"
+    echo "Recipient group:  $group"
+    echo "Campaign URL:     $LAB_PUBLIC_URL"
+    echo
+    echo "Creating this campaign may immediately begin"
+    echo "sending email through GoPhish."
+    echo
+
+    read "answer?Type LAUNCH to continue: "
+
+    if [[ "$answer" != "LAUNCH" ]]; then
+        echo "[CANCELLED] No campaign created."
+        return
+    fi
+
+    local payload
+
+    payload="$(
+        jq -n \
+            --arg name "$name" \
+            --arg template "$template" \
+            --arg page "$page" \
+            --arg profile "$profile" \
+            --arg group "$group" \
+            --arg url "$LAB_PUBLIC_URL" \
+            '{
+                name: $name,
+                template: {
+                    name: $template
+                },
+                page: {
+                    name: $page
+                },
+                smtp: {
+                    name: $profile
+                },
+                groups: [
+                    {
+                        name: $group
+                    }
+                ],
+                url: $url
+            }'
+    )"
+
+    echo
+    echo "[INFO] Creating campaign..."
+
+    api_post "/api/campaigns/" "$payload" |
+        jq .
+
+    echo
+    echo "[OK] Campaign submitted."
+}
+
+# ------------------------------------------------------------
+# doctor
+# ------------------------------------------------------------
+
+cmd_doctor() {
+
+    echo "=== Dependencies ==="
+
+    for cmd in curl jq awk ss pgrep; do
+
+        if command -v "$cmd" >/dev/null 2>&1; then
+            echo "[OK] $cmd"
+        else
+            echo "[MISSING] $cmd"
+        fi
+
+    done
+
+    echo
+    echo "=== Configuration ==="
+
+    if [[ -f "$CONFIG_FILE" ]]; then
+        echo "[OK] $CONFIG_FILE"
+        echo "Permissions: $(stat -c '%a' "$CONFIG_FILE" 2>/dev/null || true)"
+    else
+        echo "[MISSING] $CONFIG_FILE"
+    fi
+
+    echo
+    echo "=== GoPhish ==="
+
+    pgrep -af gophish || echo "[WARN] GoPhish process not detected."
+
+    echo
+    echo "=== Ports ==="
+
+    sudo ss -lntp |
+        grep -E ':(80|443|3333)\b' ||
+        echo "[WARN] No expected listeners detected."
+}
+
+# ------------------------------------------------------------
+# help
+# ------------------------------------------------------------
+
+cmd_help() {
+
+    cat <<'EOF'
+gophishctl
+
+COMMANDS
+
+  configure
+      Configure API URL, API key, and campaign URL.
+
+  status
+      Test GoPhish API connectivity and listeners.
+
+  doctor
+      Check dependencies, configuration and services.
+
+  list groups
+  list templates
+  list pages
+  list profiles
+  list campaigns
+
+  group import CSV GROUP_NAME
+      Create a recipient group from CSV.
+
+  campaign launch NAME TEMPLATE PAGE PROFILE GROUP
+      Review and explicitly launch a campaign.
+
+  results CAMPAIGN_ID
+      Download complete campaign results.
+
+  report CAMPAIGN_ID
+      Generate a simple awareness report.
+
+CSV FORMAT
+
+  email,first_name,last_name,position
+  user1@example.com,Alice,Example,Analyst
+  user2@example.com,Bob,Example,Manager
+
+EOF
+}
+
+# ------------------------------------------------------------
+# Main
+# ------------------------------------------------------------
+
+need_cmd curl
+need_cmd jq
+
+load_config
+
+case "${1:-help}" in
+
+    configure)
+        cmd_configure
+        ;;
+
+    status)
+        cmd_status
+        ;;
+
+    doctor)
+        cmd_doctor
+        ;;
+
+    list)
+        shift
+        cmd_list "$@"
+        ;;
+
+    group)
+        shift
+
+        case "${1:-}" in
+            import)
+                shift
+                cmd_group_import "$@"
+                ;;
+            *)
+                die "Usage: gophishctl group import CSV GROUP_NAME"
+                ;;
+        esac
+        ;;
+
+    campaign)
+        shift
+
+        case "${1:-}" in
+            launch)
+                shift
+                cmd_campaign_launch "$@"
+                ;;
+            *)
+                die "Usage: gophishctl campaign launch NAME TEMPLATE PAGE PROFILE GROUP"
+                ;;
+        esac
+        ;;
+
+    results)
+        shift
+        cmd_results "$@"
+        ;;
+
+    report)
+        shift
+        cmd_report "$@"
+        ;;
+
+    help|-h|--help)
+        cmd_help
+        ;;
+
+    *)
+        cmd_help
+        exit 1
+        ;;
+esac

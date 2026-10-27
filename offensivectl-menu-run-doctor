@@ -1,0 +1,8 @@
+#!/usr/bin/env bash
+set -Eeuo pipefail
+# MENU_LABEL=Run doctor
+# MENU_DESCRIPTION=Check installation health.
+# MENU_RISK=low
+CLI="${OFFENSIVECTL_COMMAND:-$(command -v offensivectl || true)}"
+[[ -n "$CLI" ]] || { printf 'ERROR: offensivectl was not found in PATH.\n' >&2; exit 127; }
+exec "$CLI" doctor

@@ -1,0 +1,28 @@
+#!/usr/bin/env bash
+set -Eeuo pipefail
+
+ROOT="/opt/offensive"
+OLD_DIR="$ROOT/archive/old-venv"
+TS="$(date +%Y%m%d-%H%M%S)"
+
+cd "$ROOT"
+
+mkdir -p "$OLD_DIR"
+
+if [[ -d "$ROOT/venv" ]]; then
+    mv "$ROOT/venv" "$OLD_DIR/venv.$TS"
+fi
+
+python3 -m venv "$ROOT/venv"
+source "$ROOT/venv/bin/activate"
+
+python -m pip install --upgrade pip setuptools wheel
+
+if [[ -f "$ROOT/requirements.txt" ]]; then
+    pip install -r "$ROOT/requirements.txt" || true
+fi
+
+python -m pip freeze > "$ROOT/requirements.lock.txt"
+
+echo "Rebuilt venv: $ROOT/venv"
+echo "Activate with: source /opt/offensive/venv/bin/activate"

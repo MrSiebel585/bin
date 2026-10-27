@@ -1,0 +1,295 @@
+#!/usr/bin/env bash
+# offensive-ai — Ollama-powered AI assistant for offensive security workflows
+# Usage: offensive-ai <command> [options] "message"
+set -Eeuo pipefail
+
+OFFENSIVE_LOGS="${OFFENSIVE_LOGS:-/var/log/offensive}"
+OLLAMA_URL="${OLLAMA_URL:-http://127.0.0.1:11434}"
+OLLAMA_MODEL="${OLLAMA_MODEL:-llama3.2}"
+LOG_FILE="${OFFENSIVE_LOGS}/offensive-ai.log"
+
+readonly RED="\033[31m"
+readonly GREEN="\033[32m"
+readonly NC="\033[0m"
+
+mkdir -p "$OFFENSIVE_LOGS"
+
+usage() {
+    cat <<USAGE
+Usage: offensive-ai <command> [options] "message"
+
+Commands:
+  summarise    Summarise tool/module output concisely
+  explain      Explain a Kali Linux tool, command, or concept
+  analyse      Analyse tool output for security insights
+  chat         General conversation with AI
+  shell        Get safe shell command suggestions
+  report       Draft a defensive/authorized training report
+  status       Check Ollama connectivity and available models
+  models       List available models from Ollama
+
+Options:
+  --model NAME   Specify Ollama model (default: $OLLAMA_MODEL)
+  --temp VALUE   Temperature 0.0-1.0 (default: 0.2)
+  --stdin        Read the message from standard input
+  -h, --help     Show this help
+
+Examples:
+  offensive-ai status
+  offensive-ai summarise "\$(cat /path/to/nmap-output.txt)"
+  offensive-ai explain "nmap -sV -p- target"
+  offensive-ai analyse "\$(cat module-output.txt)" --model gemma4:12b
+  offensive-ai chat "What is OSINT?"
+  offensive-ai shell "find open ports on 192.168.1.0/24"
+  offensive-ai report "Scan of example.com found Apache 2.4.49"
+USAGE
+}
+
+# Check Ollama availability
+ollama_available() {
+    curl -sf "$OLLAMA_URL/api/tags" >/dev/null 2>&1
+}
+
+# List installed models
+list_models() {
+    if ! ollama_available; then
+        echo -e "${RED}[ERROR]${NC} Ollama not reachable at $OLLAMA_URL" >&2
+        return 1
+    fi
+    curl -s "$OLLAMA_URL/api/tags" | python3 -c "
+import json, sys
+try:
+    data = json.load(sys.stdin)
+    for m in data.get('models', []):
+        name = m['name']
+        size_gb = m['size'] / 1e9 if 'size' in m else 0
+        print(f'  {name}  ({size_gb:.1f}GB)')
+except Exception:
+    print('(unable to parse model list)')
+"
+}
+
+# Status / health check
+cmd_status() {
+    if ollama_available; then
+        echo -e "${GREEN}[OK]${NC} Ollama is running at $OLLAMA_URL"
+        echo ""
+        echo "Available models:"
+        list_models || true
+    else
+        echo -e "${RED}[ERROR]${NC} Ollama not reachable at $OLLAMA_URL"
+        echo "Start with: ollama serve"
+        echo "Or install with: curl -fsSL https://ollama.ai/install.sh | sh"
+        return 1
+    fi
+}
+
+# Build system prompt based on mode
+build_system_prompt() {
+    local mode="$1"
+    case "$mode" in
+        summarise)
+            cat <<'SYSTEM'
+You are a concise Kali Linux/offensive security output summariser.
+Given tool output, provide:
+1. **Key Findings** — bullet-point summary of important results
+2. **Notable Items** — anything unusual, high-risk, or interesting
+3. **Next Steps** — recommended follow-up actions
+
+Keep it brief and actionable. Focus on security relevance.
+SYSTEM
+            ;;
+        explain)
+            cat <<'SYSTEM'
+You are a Kali Linux training assistant.
+Given a tool name or command, explain:
+1. **Purpose** — what it does
+2. **Syntax** — how to use it
+3. **Expected Output** — what results look like
+4. **Risks** — operational security considerations
+5. **Safe Usage** — how to use it responsibly
+
+Assume the user is an authorized security professional.
+SYSTEM
+            ;;
+        analyse)
+            cat <<'SYSTEM'
+You are an offensive security analysis assistant.
+Given tool output, provide:
+1. **Summary** — what the scan/data reveals
+2. **Vulnerabilities** — potential weaknesses identified
+3. **Risk Assessment** — severity of findings
+4. **Recommendations** — remediation or next steps
+
+Be specific and reference actual findings from the output.
+SYSTEM
+            ;;
+        report)
+            cat <<'SYSTEM'
+You help draft defensive security reports for authorized testing.
+Given findings, create a factual, scoped, evidence-friendly summary.
+Focus on: what was found, severity, and recommended actions.
+Remain objective and professional.
+SYSTEM
+            ;;
+        shell)
+            cat <<'SYSTEM'
+You provide safe Kali Linux shell commands for authorized testing.
+For each suggestion:
+1. Explain what the command does
+2. Provide the exact command
+3. Note any prerequisites or risks
+Keep it safe, scoped, and non-destructive.
+SYSTEM
+            ;;
+        chat|*)
+            cat <<'SYSTEM'
+You are a helpful Kali Linux and offensive security assistant.
+Provide accurate, actionable information for authorized security testing.
+Keep responses clear and technically precise.
+SYSTEM
+            ;;
+    esac
+}
+
+# Send prompt to Ollama
+ask_ollama() {
+    local mode="$1"
+    local user_msg="$2"
+    local model="${OLLAMA_MODEL}"
+    local temperature="${OLLAMA_TEMPERATURE:-0.2}"
+
+    local system_prompt
+    system_prompt="$(build_system_prompt "$mode")"
+
+    printf "[%s] mode=%s model=%s\n" "$(date '+%Y-%m-%d %H:%M:%S')" "$mode" "$model" >> "$LOG_FILE"
+
+    if ! ollama_available; then
+        echo -e "${RED}[ERROR]${NC} Ollama not reachable at $OLLAMA_URL" >&2
+        echo "Start Ollama with: ollama serve" >&2
+        return 1
+    fi
+
+    # NUL-delimited stdin keeps untrusted prompt text out of Python source and argv.
+    printf '%s\0%s\0' "$system_prompt" "$user_msg" | \
+    OFFENSIVE_AI_URL="$OLLAMA_URL/api/chat" \
+    OFFENSIVE_AI_MODEL="$model" \
+    OFFENSIVE_AI_TEMPERATURE="$temperature" \
+    python3 -c '
+import json, os, sys, urllib.request, urllib.error
+
+parts = sys.stdin.buffer.read().decode("utf-8", errors="replace").split("\0")
+system_prompt, user_msg = parts[0], parts[1]
+url = os.environ["OFFENSIVE_AI_URL"]
+model = os.environ["OFFENSIVE_AI_MODEL"]
+temperature = float(os.environ["OFFENSIVE_AI_TEMPERATURE"])
+
+payload = {
+    "model": model,
+    "messages": [
+        {"role": "system", "content": system_prompt},
+        {"role": "user", "content": user_msg}
+    ],
+    "options": {
+        "temperature": temperature,
+        "num_predict": 2048
+    },
+    "stream": False
+}
+
+req = urllib.request.Request(
+    url,
+    data=json.dumps(payload).encode("utf-8"),
+    headers={"Content-Type": "application/json"},
+    method="POST"
+)
+
+try:
+    with urllib.request.urlopen(req, timeout=120) as resp:
+        data = json.loads(resp.read().decode("utf-8"))
+        if "message" in data and "content" in data["message"]:
+            print(data["message"]["content"])
+        elif "error" in data:
+            print("[ERROR] {}".format(data["error"]), file=sys.stderr)
+            sys.exit(1)
+        else:
+            print(json.dumps(data, indent=2))
+except urllib.error.URLError as e:
+    print(f"[ERROR] Ollama request failed: {e.reason}", file=sys.stderr)
+    sys.exit(1)
+except json.JSONDecodeError as e:
+    print(f"[ERROR] Invalid response: {e}", file=sys.stderr)
+    sys.exit(1)
+' 2>>"$LOG_FILE"
+}
+
+# Main dispatch
+main() {
+    local model=""
+    local temperature=""
+    local cmd=""
+    local read_stdin=0
+    local args=()
+
+    while [[ $# -gt 0 ]]; do
+        case "$1" in
+            --model)
+                model="$2"; shift 2 ;;
+            --temp)
+                temperature="$2"; shift 2 ;;
+            --stdin)
+                read_stdin=1; shift ;;
+            -h|--help)
+                usage; exit 0 ;;
+            --*)
+                echo "Unknown option: $1" >&2; exit 1 ;;
+            *)
+                if [[ -z "$cmd" ]]; then
+                    cmd="$1"
+                else
+                    args+=("$1")
+                fi
+                shift ;;
+        esac
+    done
+
+    [[ -n "$model" ]] && OLLAMA_MODEL="$model"
+    [[ -n "$temperature" ]] && OLLAMA_TEMPERATURE="$temperature"
+
+    local message="${args[*]:-}"
+    if (( read_stdin )); then
+        message="$(cat)"
+    fi
+
+    case "$cmd" in
+        status)
+            cmd_status
+            ;;
+        models)
+            if ollama_available; then
+                echo "Available models:"
+                list_models
+            else
+                echo -e "${RED}[ERROR]${NC} Ollama not reachable at $OLLAMA_URL" >&2
+                exit 1
+            fi
+            ;;
+        summarise|explain|analyse|analyze|report|shell|chat)
+            if [[ -z "$message" ]]; then
+                echo "Usage: offensive-ai $cmd [--model NAME] \"message\"" >&2
+                exit 1
+            fi
+            local mode="$cmd"
+            [[ "$mode" == "analyze" ]] && mode="analyse"
+            ask_ollama "$mode" "$message"
+            ;;
+        -h|--help|help|"")
+            usage
+            ;;
+        *)
+            ask_ollama "chat" "$cmd ${args[*]}"
+            ;;
+    esac
+}
+
+main "$@"

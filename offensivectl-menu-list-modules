@@ -1,0 +1,8 @@
+#!/usr/bin/env bash
+set -Eeuo pipefail
+# MENU_LABEL=List modules
+# MENU_DESCRIPTION=Show the installed module registry.
+# MENU_RISK=low
+CLI="${OFFENSIVECTL_COMMAND:-$(command -v offensivectl || true)}"
+[[ -n "$CLI" ]] || { printf 'ERROR: offensivectl was not found in PATH.\n' >&2; exit 127; }
+exec "$CLI" list

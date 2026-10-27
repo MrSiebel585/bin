@@ -1,0 +1,6 @@
+#!/usr/bin/env bash
+set -Eeuo pipefail
+# MENU_LABEL=Backup and restore Offensivectl
+# MENU_DESCRIPTION=Create, verify, review, or restore a governed snapshot.
+# MENU_RISK=medium
+exec sudo -E /usr/local/bin/offensivectl-safeguard menu

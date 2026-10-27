@@ -1,0 +1,187 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+SOURCE_PATH="${BASH_SOURCE[0]}"
+while [[ -L "$SOURCE_PATH" ]]; do
+  SOURCE_DIR="$(cd -P -- "$(dirname -- "$SOURCE_PATH")" && pwd)"
+  SOURCE_PATH="$(readlink -- "$SOURCE_PATH")"
+  [[ "$SOURCE_PATH" != /* ]] && SOURCE_PATH="$SOURCE_DIR/$SOURCE_PATH"
+done
+
+SCRIPT_DIR="$(cd -P -- "$(dirname -- "$SOURCE_PATH")" && pwd)"
+readonly SCRIPT_DIR
+ROOT_DIR="${OFFENSIVECTL_ROOT:-$(cd "$SCRIPT_DIR/.." && pwd -P)}"
+readonly ROOT_DIR
+readonly MODULES_DIR="$ROOT_DIR/modules"
+
+usage() {
+  cat <<USAGE
+Usage:
+  offensive-module-runner list
+  offensive-module-runner <module> [module-options]
+  offensive-module-runner run <module> [module-options]
+
+Modules use dot syntax: category.module
+
+Examples:
+  offensive-module-runner list
+  offensive-module-runner dns.whois_lookup --help
+  offensive-module-runner network.nmap_scan --case CASE-001 --target 127.0.0.1 --authorization approved-lab
+
+Compatibility aliases:
+  nmap, nmap_scan, theharvester, ettercap, tshark
+USAGE
+}
+
+yaml_value() {
+  local key="$1"
+  local file="$2"
+
+  grep "^${key}:" "$file" 2>/dev/null \
+    | head -n 1 \
+    | cut -d: -f2- \
+    | sed -E 's/^[[:space:]]+//; s/[[:space:]]+$//' || true
+}
+
+module_alias() {
+  case "$1" in
+    nmap)
+      printf '%s\n' "network.nmap"
+      ;;
+    nmap_scan)
+      printf '%s\n' "network.nmap_scan"
+      ;;
+    theharvester|theHarvester)
+      printf '%s\n' "osint.theharvester"
+      ;;
+    ettercap)
+      printf '%s\n' "network.ettercap"
+      ;;
+    tshark)
+      printf '%s\n' "pcap.tshark"
+      ;;
+    *)
+      printf '%s\n' "$1"
+      ;;
+  esac
+}
+
+validate_module_name() {
+  local module_name="$1"
+
+  [[ "$module_name" != /* && "$module_name" != *..* && "$module_name" != *\\* ]] || {
+    echo "Invalid module name: $module_name" >&2
+    exit 1
+  }
+  [[ "$module_name" =~ ^[A-Za-z0-9._/-]+$ ]] || {
+    echo "Invalid module name: $module_name" >&2
+    exit 1
+  }
+}
+
+module_dir_for() {
+  local module_name="$1"
+  local module_root
+  local module_dir
+
+  module_name="${module_name#modules/}"
+  module_name="${module_name%/module.sh}"
+  module_name="${module_name%.module.sh}"
+  module_name="${module_name%/}"
+  module_name="$(module_alias "$module_name")"
+  module_name="${module_name//\//.}"
+  validate_module_name "$module_name"
+
+  module_root="$(realpath -m "$MODULES_DIR")"
+  module_dir="$(realpath -m "$MODULES_DIR/${module_name//./\/}")"
+  case "$module_dir" in
+    "$module_root"/*)
+      printf '%s\n' "$module_dir"
+      ;;
+    *)
+      echo "Module path escapes modules root: $module_name" >&2
+      exit 1
+      ;;
+  esac
+}
+
+list_modules() {
+  [[ -d "$MODULES_DIR" ]] || {
+    echo "Missing modules directory: $MODULES_DIR" >&2
+    exit 1
+  }
+
+  local count=0
+  local category_dir module_dir category module mode risk description
+
+  shopt -s nullglob
+  for category_dir in "$MODULES_DIR"/*; do
+    [[ -d "$category_dir" && ! -L "$category_dir" ]] || continue
+
+    for module_dir in "$category_dir"/*; do
+      [[ -d "$module_dir" && -f "$module_dir/module.yaml" ]] || continue
+
+      category="$(basename "$category_dir")"
+      module="$(basename "$module_dir")"
+      mode="$(yaml_value mode "$module_dir/module.yaml")"
+      risk="$(yaml_value risk_level "$module_dir/module.yaml")"
+      description="$(yaml_value description "$module_dir/module.yaml")"
+
+      printf '%s.%s	%s	%s	%s
+' "$category" "$module" "$mode" "$risk" "$description"
+      count=$((count + 1))
+    done
+  done
+
+  if [[ "$count" -eq 0 ]]; then
+    echo "No modules found under: $MODULES_DIR" >&2
+    exit 1
+  fi
+}
+
+run_module() {
+  local module_name="${1:-}"
+  [[ -n "$module_name" ]] || {
+    usage >&2
+    exit 1
+  }
+  shift || true
+
+  local module_dir
+  module_dir="$(module_dir_for "$module_name")"
+
+  [[ -d "$module_dir" ]] || {
+    echo "Module not found: $module_name => $module_dir" >&2
+    exit 1
+  }
+
+  [[ -f "$module_dir/module.sh" ]] || {
+    echo "Module script missing: $module_dir/module.sh" >&2
+    exit 1
+  }
+
+  export OFFENSIVECTL_ROOT="$ROOT_DIR"
+  exec bash "$module_dir/module.sh" "$@"
+}
+
+main() {
+  local command="${1:-help}"
+
+  case "$command" in
+    list)
+      list_modules
+      ;;
+    run)
+      shift || true
+      run_module "$@"
+      ;;
+    help|--help|-h)
+      usage
+      ;;
+    *)
+      run_module "$@"
+      ;;
+  esac
+}
+
+main "$@"

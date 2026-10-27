@@ -1,0 +1,345 @@
+#!/usr/bin/env python3
+"""
+Pagodo AI-Guided CLI Wrapper
+Integrates pagodo with AI-driven query suggestions for enhanced OSINT reconnaissance
+"""
+
+import argparse
+import json
+import os
+import sys
+import subprocess
+import time
+from pathlib import Path
+from datetime import datetime
+from typing import Dict, List, Optional, Tuple
+
+# Color codes for terminal output
+class Colors:
+    HEADER = '\033[95m'
+    BLUE = '\033[94m'
+    CYAN = '\033[96m'
+    GREEN = '\033[92m'
+    YELLOW = '\033[93m'
+    RED = '\033[91m'
+    BOLD = '\033[1m'
+    UNDERLINE = '\033[4m'
+    END = '\033[0m'
+
+# ============================================================================
+# AI Provider Integration (Local LLM via Ollama/LM Studio)
+# ============================================================================
+
+class AIQuerySuggester:
+    """Generate AI-driven dork suggestions for domain reconnaissance"""
+    
+    def __init__(self, api_endpoint: str = "http://127.0.0.1:11434", model: str = "neural-chat"):
+        self.api_endpoint = api_endpoint
+        self.model = model
+        self.available = self._check_availability()
+    
+    def _check_availability(self) -> bool:
+        """Check if local LLM is available"""
+        try:
+            import requests
+            response = requests.get(f"{self.api_endpoint}/api/tags", timeout=2)
+            return response.status_code == 200
+        except Exception:
+            return False
+    
+    def suggest_dorks(self, domain: str, category: Optional[str] = None, 
+                      previous_results: Optional[List[str]] = None) -> List[str]:
+        """Generate AI suggestions for effective dorks"""
+        if not self.available:
+            return self._fallback_suggestions(domain, category)
+        
+        try:
+            prompt = self._build_prompt(domain, category, previous_results)
+            suggestions = self._query_llm(prompt)
+            return self._parse_suggestions(suggestions)
+        except Exception as e:
+            print(f"{Colors.YELLOW}[!] AI suggestion failed, using fallback{Colors.END}", file=sys.stderr)
+            return self._fallback_suggestions(domain, category)
+    
+    def _build_prompt(self, domain: str, category: Optional[str], 
+                      previous_results: Optional[List[str]]) -> str:
+        """Build prompt for LLM"""
+        cat_str = f"in the '{category}' category" if category else "across all categories"
+        
+        prev_str = ""
+        if previous_results:
+            prev_str = f"\n\nPrevious results already explored:\n" + \
+                      "\n".join(f"- {r}" for r in previous_results[:5])
+        
+        return f"""Generate 5 advanced Google Hacking Database (GHDB) dorks for reconnaissance against '{domain}' {cat_str}.
+
+Requirements:
+- Each dork must be a valid Google search query
+- Focus on sensitive documents, misconfigurations, and exposed data
+- Include site: operator with the domain
+- Mix different search operators (filetype, inurl, intitle, etc.)
+- Prioritize high-value reconnaissance targets
+- Avoid obvious/generic queries{prev_str}
+
+Format your response as a JSON array with objects containing 'dork' and 'description' fields.
+Example format:
+[
+  {{"dork": "site:{domain} filetype:pdf", "description": "Find PDFs hosted on domain"}},
+  {{"dork": "site:{domain} inurl:admin", "description": "Find admin panels"}}
+]
+
+Generate dorks now:"""
+    
+    def _query_llm(self, prompt: str) -> str:
+        """Query local LLM for suggestions"""
+        try:
+            import requests
+            response = requests.post(
+                f"{self.api_endpoint}/api/generate",
+                json={"model": self.model, "prompt": prompt, "stream": False},
+                timeout=30
+            )
+            if response.status_code == 200:
+                return response.json().get("response", "")
+        except Exception:
+            pass
+        return ""
+    
+    def _parse_suggestions(self, response: str) -> List[str]:
+        """Parse LLM response to extract dorks"""
+        try:
+            # Try to extract JSON from response
+            start = response.find('[')
+            end = response.rfind(']') + 1
+            if start >= 0 and end > start:
+                json_str = response[start:end]
+                suggestions = json.loads(json_str)
+                return [s.get('dork', '') for s in suggestions if s.get('dork')]
+        except json.JSONDecodeError:
+            pass
+        return []
+    
+    def _fallback_suggestions(self, domain: str, category: Optional[str] = None) -> List[str]:
+        """Fallback suggestions when AI is unavailable"""
+        fallback = {
+            'documents': [
+                f'site:{domain} filetype:pdf',
+                f'site:{domain} filetype:doc OR filetype:docx',
+                f'site:{domain} filetype:xls OR filetype:xlsx',
+                f'site:{domain} "confidential" filetype:pdf',
+                f'site:{domain} "internal" filetype:doc',
+            ],
+            'exposed_directories': [
+                f'site:{domain} inurl:/admin',
+                f'site:{domain} inurl:/config',
+                f'site:{domain} inurl:/backup',
+                f'site:{domain} "index of"',
+                f'site:{domain} inurl:/database',
+            ],
+            'development': [
+                f'site:{domain} inurl:debug OR inurl:test',
+                f'site:{domain} ".env" OR ".git"',
+                f'site:{domain} inurl:swagger OR inurl:graphql',
+                f'site:{domain} "development" OR "staging"',
+                f'site:{domain} localhost OR 127.0.0.1',
+            ],
+            'credentials': [
+                f'site:{domain} "password" OR "api_key"',
+                f'site:{domain} "username:" OR "password:"',
+                f'site:{domain} "token" OR "secret"',
+                f'site:{domain} filetype:txt "password"',
+                f'site:{domain} inurl:login OR inurl:auth',
+            ],
+            'infrastructure': [
+                f'site:{domain} inurl:phpmyadmin',
+                f'site:{domain} inurl:cpanel OR inurl:whm',
+                f'site:{domain} inurl:jenkins OR inurl:tomcat',
+                f'site:{domain} cloud.google.com OR cloudfront',
+                f'site:{domain} s3.amazonaws.com OR s3-',
+            ]
+        }
+        
+        if category and category in fallback:
+            return fallback[category]
+        
+        # Return mixed suggestions from all categories
+        all_suggestions = []
+        for suggestions_list in fallback.values():
+            all_suggestions.extend(suggestions_list[:1])
+        return all_suggestions
+
+# ============================================================================
+# Pagodo Orchestrator
+# ============================================================================
+
+class PagodoOrchestrator:
+    """Orchestrate pagodo execution with AI guidance"""
+    
+    def __init__(self, case_id: str, target: str, scope_file: str, 
+                 auth: str, verbose: bool = False):
+        self.case_id = case_id
+        self.target = target
+        self.scope_file = scope_file
+        self.auth = auth
+        self.verbose = verbose
+        self.module_path = Path(__file__).parent.parent / 'modules/osint/pagodo/module.sh'
+        self.ai_suggester = AIQuerySuggester()
+        self.results_dir = None
+    
+    def run_interactive(self):
+        """Run interactive mode with AI guidance"""
+        print(f"\n{Colors.HEADER}{Colors.BOLD}=== Pagodo AI-Guided OSINT Reconnaissance ==={Colors.END}\n")
+        
+        print(f"{Colors.CYAN}Target Domain:{Colors.END} {self.target}")
+        print(f"{Colors.CYAN}Case ID:{Colors.END} {self.case_id}")
+        print(f"{Colors.CYAN}AI Suggester:{Colors.END} {'Available' if self.ai_suggester.available else 'Unavailable (using fallback)'}\n")
+        
+        # Run pagodo with default settings
+        self._run_pagodo_with_ai_suggestions()
+    
+    def _run_pagodo_with_ai_suggestions(self):
+        """Execute pagodo and show AI suggestions"""
+        print(f"{Colors.BOLD}[*] Analyzing domain for optimal query strategies...{Colors.END}")
+        
+        # Get AI suggestions for different categories
+        categories = ['documents', 'exposed_directories', 'development', 'credentials', 'infrastructure']
+        
+        print(f"\n{Colors.BLUE}AI-Suggested Query Categories:{Colors.END}\n")
+        for category in categories:
+            suggestions = self.ai_suggester.suggest_dorks(self.target, category)
+            if suggestions:
+                print(f"  {Colors.CYAN}{category.replace('_', ' ').title()}:{Colors.END}")
+                for i, dork in enumerate(suggestions[:2], 1):
+                    print(f"    {i}. {dork}")
+            print()
+        
+        # Execute pagodo
+        self._execute_pagodo()
+    
+    def _execute_pagodo(self):
+        """Execute the pagodo module"""
+        print(f"{Colors.BOLD}[*] Executing pagodo reconnaissance...{Colors.END}\n")
+        
+        cmd = [
+            'bash',
+            str(self.module_path),
+            '--case', self.case_id,
+            '--target', self.target,
+            '--scope-file', self.scope_file,
+            '--authorization', self.auth,
+            '--format', 'json',
+        ]
+        
+        if self.verbose:
+            cmd.append('--verbose')
+        
+        try:
+            result = subprocess.run(cmd, capture_output=True, text=True, timeout=3600)
+            
+            if result.returncode == 0:
+                self.results_dir = result.stdout.strip().split('\n')[-1]
+                print(f"\n{Colors.GREEN}[✓] Pagodo reconnaissance completed successfully{Colors.END}")
+                print(f"{Colors.GREEN}    Results saved to: {self.results_dir}{Colors.END}\n")
+                self._display_summary()
+            else:
+                print(f"\n{Colors.RED}[✗] Pagodo execution failed{Colors.END}")
+                if result.stderr:
+                    print(f"{Colors.RED}{result.stderr}{Colors.END}")
+                sys.exit(1)
+        
+        except subprocess.TimeoutExpired:
+            print(f"{Colors.RED}[✗] Pagodo execution timed out{Colors.END}")
+            sys.exit(1)
+        except Exception as e:
+            print(f"{Colors.RED}[✗] Error executing pagodo: {e}{Colors.END}")
+            sys.exit(1)
+    
+    def _display_summary(self):
+        """Display summary of results"""
+        if not self.results_dir or not Path(self.results_dir).exists():
+            return
+        
+        results_path = Path(self.results_dir)
+        
+        # Count URLs
+        urls_file = results_path / 'urls.txt'
+        if urls_file.exists():
+            url_count = sum(1 for line in urls_file.readlines())
+            print(f"{Colors.CYAN}Total URLs Found:{Colors.END} {url_count}")
+        
+        # List artifacts
+        print(f"\n{Colors.CYAN}Generated Artifacts:{Colors.END}")
+        for artifact in sorted(results_path.glob('*')):
+            if artifact.is_file():
+                size = artifact.stat().st_size
+                size_str = f"{size / 1024:.1f}KB" if size > 1024 else f"{size}B"
+                print(f"  - {artifact.name} ({size_str})")
+
+# ============================================================================
+# Main CLI
+# ============================================================================
+
+def main():
+    parser = argparse.ArgumentParser(
+        description='Pagodo AI-Guided OSINT CLI - Automated GHDB reconnaissance with AI suggestions',
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+        epilog="""
+Examples:
+  # Interactive mode with AI guidance
+  %(prog)s --case CASE-2024-001 --target example.com --scope scope.txt
+  
+  # Batch mode (no AI suggestions)
+  %(prog)s --case CASE-2024-001 --target example.com --scope scope.txt --batch
+  
+  # Custom dorks file
+  %(prog)s --case CASE-2024-001 --target example.com --scope scope.txt \\
+    --dorks custom-dorks.txt --ai-off
+        """
+    )
+    
+    required = parser.add_argument_group('Required Arguments')
+    required.add_argument('--case', required=True, help='Case ID (format: CASE-XXXX)')
+    required.add_argument('--target', required=True, help='Target domain')
+    required.add_argument('--scope', required=True, help='Scope validation file')
+    
+    optional = parser.add_argument_group('Optional Arguments')
+    optional.add_argument('--auth', default='authorized', help='Authorization token')
+    optional.add_argument('--batch', action='store_true', help='Run in batch mode (no interactive AI suggestions)')
+    optional.add_argument('--ai-off', action='store_true', help='Disable AI suggestions')
+    optional.add_argument('--ai-endpoint', default='http://127.0.0.1:11434', help='Local LLM endpoint')
+    optional.add_argument('--ai-model', default='neural-chat', help='LLM model name')
+    optional.add_argument('--dorks', help='Custom GHDB dorks file')
+    optional.add_argument('--delay-min', type=int, default=5, help='Minimum search delay (seconds)')
+    optional.add_argument('--delay-max', type=int, default=15, help='Maximum search delay (seconds)')
+    optional.add_argument('--max-results', type=int, default=100, help='Maximum results per dork')
+    optional.add_argument('--proxy', help='HTTP proxy URL')
+    optional.add_argument('--timeout', type=int, default=30, help='Query timeout (seconds)')
+    optional.add_argument('--verbose', '-v', action='store_true', help='Verbose logging')
+    optional.add_argument('--version', action='version', version='%(prog)s 1.0.0')
+    
+    args = parser.parse_args()
+    
+    # Create orchestrator
+    orchestrator = PagodoOrchestrator(
+        case_id=args.case,
+        target=args.target,
+        scope_file=args.scope,
+        auth=args.auth,
+        verbose=args.verbose
+    )
+    
+    # Override AI if needed
+    if args.ai_off:
+        orchestrator.ai_suggester.available = False
+    else:
+        orchestrator.ai_suggester.api_endpoint = args.ai_endpoint
+        orchestrator.ai_suggester.model = args.ai_model
+    
+    # Run interactive mode
+    if not args.batch:
+        orchestrator.run_interactive()
+    else:
+        orchestrator._execute_pagodo()
+
+if __name__ == '__main__':
+    main()

@@ -1,0 +1,287 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+SOURCE_PATH="${BASH_SOURCE[0]}"
+while [[ -L "$SOURCE_PATH" ]]; do
+  SOURCE_DIR="$(cd -P -- "$(dirname -- "$SOURCE_PATH")" && pwd)"
+  SOURCE_PATH="$(readlink -- "$SOURCE_PATH")"
+  [[ "$SOURCE_PATH" != /* ]] && SOURCE_PATH="$SOURCE_DIR/$SOURCE_PATH"
+done
+
+SCRIPT_DIR="$(cd -P -- "$(dirname -- "$SOURCE_PATH")" && pwd)"
+readonly SCRIPT_DIR
+ROOT_DIR="${OFFENSIVECTL_ROOT:-$(cd "$SCRIPT_DIR/.." && pwd -P)}"
+readonly ROOT_DIR
+
+MANIFEST="$ROOT_DIR/config/immutable-fhs.tsv"
+TARGET_ROOT="$ROOT_DIR/outputs/scaffold/immutable-fhs"
+ALLOW_SYSTEM=false
+SEAL=true
+
+usage() {
+  cat <<USAGE
+Usage:
+  offensive-fhs <plan|apply|verify|manifest> [options]
+
+Options:
+  --manifest FILE       Hierarchy manifest (default: config/immutable-fhs.tsv)
+  --target DIR          Staging root (default: outputs/scaffold/immutable-fhs)
+  --system              Allow --target / for real host hierarchy work
+  --no-seal             Create paths without applying manifest modes
+  -h, --help            Show this help
+
+The manifest paths are absolute Linux FHS-style paths. By default they are
+materialized under the staging root, not on the live system.
+USAGE
+}
+
+die() {
+  printf '[offensive-fhs] ERROR: %s\n' "$*" >&2
+  exit 1
+}
+
+log() {
+  printf '[offensive-fhs] %s\n' "$*"
+}
+
+is_data_row() {
+  local spec_path="$1"
+  [[ -n "$spec_path" && "$spec_path" != \#* ]]
+}
+
+validate_row() {
+  local spec_path="$1"
+  local kind="$2"
+  local mode="$3"
+
+  [[ "$spec_path" == /* ]] || die "manifest path must be absolute: $spec_path"
+  [[ "$spec_path" != *".."* ]] || die "manifest path must not contain '..': $spec_path"
+  case "$kind" in
+    dir|file) ;;
+    *) die "unsupported manifest kind '$kind' for $spec_path" ;;
+  esac
+  [[ "$mode" =~ ^0?[0-7]{3,4}$ ]] || die "invalid mode '$mode' for $spec_path"
+}
+
+dest_for() {
+  local spec_path="$1"
+  local rel="${spec_path#/}"
+
+  if [[ "$TARGET_ROOT" == "/" ]]; then
+    printf '/%s\n' "$rel"
+  else
+    printf '%s/%s\n' "${TARGET_ROOT%/}" "$rel"
+  fi
+}
+
+manifest_checksum() {
+  sha256sum "$MANIFEST" | awk '{print $1}'
+}
+
+parse_options() {
+  while [[ $# -gt 0 ]]; do
+    case "$1" in
+      --manifest)
+        MANIFEST="${2:-}"
+        shift 2
+        ;;
+      --target)
+        TARGET_ROOT="${2:-}"
+        shift 2
+        ;;
+      --system)
+        ALLOW_SYSTEM=true
+        shift
+        ;;
+      --no-seal)
+        SEAL=false
+        shift
+        ;;
+      -h|--help)
+        usage
+        exit 0
+        ;;
+      *)
+        die "unknown option: $1"
+        ;;
+    esac
+  done
+
+  [[ -f "$MANIFEST" ]] || die "manifest not found: $MANIFEST"
+  [[ -n "$TARGET_ROOT" ]] || die "--target cannot be empty"
+  if [[ "$TARGET_ROOT" == "/" && "$ALLOW_SYSTEM" != "true" ]]; then
+    die "--target / requires --system"
+  fi
+}
+
+cmd_manifest() {
+  printf 'manifest=%s\n' "$MANIFEST"
+  printf 'sha256=%s\n' "$(manifest_checksum)"
+}
+
+cmd_plan() {
+  log "manifest: $MANIFEST"
+  log "target: $TARGET_ROOT"
+  log "seal modes: $SEAL"
+  printf '\n%-38s %-6s %-6s %-10s %s\n' "PATH" "KIND" "MODE" "MUTABLE" "PURPOSE"
+
+  local spec_path kind mode mutability purpose
+  while IFS=$'\t' read -r spec_path kind mode mutability purpose; do
+    is_data_row "${spec_path:-}" || continue
+    validate_row "$spec_path" "$kind" "$mode"
+    printf '%-38s %-6s %-6s %-10s %s\n' "$spec_path" "$kind" "$mode" "$mutability" "$purpose"
+  done < "$MANIFEST"
+}
+
+create_dirs() {
+  local spec_path kind mode mutability purpose dest
+  while IFS=$'\t' read -r spec_path kind mode mutability purpose; do
+    is_data_row "${spec_path:-}" || continue
+    validate_row "$spec_path" "$kind" "$mode"
+    [[ "$kind" == "dir" ]] || continue
+
+    dest="$(dest_for "$spec_path")"
+    if [[ -e "$dest" && ! -d "$dest" ]]; then
+      die "expected directory but found another type: $dest"
+    fi
+    mkdir -p "$dest"
+  done < "$MANIFEST"
+}
+
+create_files() {
+  local spec_path kind mode mutability purpose dest parent
+  while IFS=$'\t' read -r spec_path kind mode mutability purpose; do
+    is_data_row "${spec_path:-}" || continue
+    validate_row "$spec_path" "$kind" "$mode"
+    [[ "$kind" == "file" ]] || continue
+
+    dest="$(dest_for "$spec_path")"
+    parent="$(dirname "$dest")"
+    mkdir -p "$parent"
+    if [[ -e "$dest" && ! -f "$dest" ]]; then
+      die "expected file but found another type: $dest"
+    fi
+    if [[ ! -e "$dest" ]]; then
+      {
+        printf '# Managed by offensive-fhs scaffold\n'
+        printf '# FHS path: %s\n' "$spec_path"
+        printf '# Mutability: %s\n' "$mutability"
+        printf '# Purpose: %s\n' "$purpose"
+      } > "$dest"
+    fi
+  done < "$MANIFEST"
+}
+
+apply_modes() {
+  local spec_path kind mode mutability purpose dest
+  while IFS=$'\t' read -r spec_path kind mode mutability purpose; do
+    is_data_row "${spec_path:-}" || continue
+    validate_row "$spec_path" "$kind" "$mode"
+    dest="$(dest_for "$spec_path")"
+    chmod "$mode" "$dest"
+  done < "$MANIFEST"
+}
+
+cmd_apply() {
+  mkdir -p "$TARGET_ROOT"
+  create_dirs
+  create_files
+
+  if [[ "$SEAL" == "true" ]]; then
+    apply_modes
+  fi
+
+  {
+    printf 'manifest=%s\n' "$MANIFEST"
+    printf 'sha256=%s\n' "$(manifest_checksum)"
+    printf 'generated_at=%s\n' "$(date -Iseconds)"
+    printf 'target=%s\n' "$TARGET_ROOT"
+  } > "$TARGET_ROOT/.immutable-fhs.manifest"
+
+  log "scaffold applied: $TARGET_ROOT"
+}
+
+mode_of() {
+  stat -c '%a' "$1"
+}
+
+normalize_mode() {
+  local mode="$1"
+  mode="${mode#0}"
+  if [[ "${#mode}" -gt 3 ]]; then
+    mode="${mode: -3}"
+  fi
+  printf '%s\n' "$mode"
+}
+
+cmd_verify() {
+  local failures=0
+  local spec_path kind mode mutability purpose dest actual expected
+
+  while IFS=$'\t' read -r spec_path kind mode mutability purpose; do
+    is_data_row "${spec_path:-}" || continue
+    validate_row "$spec_path" "$kind" "$mode"
+    dest="$(dest_for "$spec_path")"
+
+    case "$kind" in
+      dir)
+        if [[ ! -d "$dest" ]]; then
+          printf '[FAIL] missing directory: %s\n' "$dest"
+          failures=$((failures + 1))
+          continue
+        fi
+        ;;
+      file)
+        if [[ ! -f "$dest" ]]; then
+          printf '[FAIL] missing file: %s\n' "$dest"
+          failures=$((failures + 1))
+          continue
+        fi
+        ;;
+    esac
+
+    if [[ "$SEAL" == "true" ]]; then
+      actual="$(normalize_mode "$(mode_of "$dest")")"
+      expected="$(normalize_mode "$mode")"
+      if [[ "$actual" != "$expected" ]]; then
+        printf '[FAIL] mode %s expected %s: %s\n' "$actual" "$expected" "$dest"
+        failures=$((failures + 1))
+        continue
+      fi
+    fi
+
+    printf '[OK] %s %s %s\n' "$kind" "$mutability" "$dest"
+  done < "$MANIFEST"
+
+  printf '\nSummary: %s failure(s)\n' "$failures"
+  [[ "$failures" -eq 0 ]]
+}
+
+main() {
+  local command="${1:-plan}"
+  if [[ $# -gt 0 ]]; then
+    shift
+  fi
+
+  case "$command" in
+    plan|apply|verify|manifest) ;;
+    -h|--help)
+      usage
+      exit 0
+      ;;
+    *)
+      die "unknown command: $command"
+      ;;
+  esac
+
+  parse_options "$@"
+
+  case "$command" in
+    plan) cmd_plan ;;
+    apply) cmd_apply ;;
+    verify) cmd_verify ;;
+    manifest) cmd_manifest ;;
+  esac
+}
+
+main "$@"

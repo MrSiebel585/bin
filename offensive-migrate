@@ -1,0 +1,342 @@
+#!/usr/bin/env bash
+set -Eeuo pipefail
+IFS=$'\n\t'
+
+VERSION="1.0.0"
+ROOT="${OFFENSIVE_ROOT:-/opt/omniscient/offensive}"
+REPORT_DIR="$ROOT/var/lib/scaffold"
+STATE_DIR="$ROOT/var/lib/migration-manager"
+LOG_DIR="$ROOT/var/log/migration-manager"
+APPROVAL_FILE="$STATE_DIR/approvals.tsv"
+ACTIVE_FILE="$STATE_DIR/active-transaction"
+LOCK_FILE="$STATE_DIR/manager.lock"
+
+usage() {
+  cat <<'USAGE'
+Offensive Migration Manager
+
+Usage:
+  offensive-migrate plan [PLAN.tsv]
+  offensive-migrate review [PLAN.tsv]
+  offensive-migrate approve SOURCE ACTION [PLAN.tsv]
+  offensive-migrate approve-all-proposed [PLAN.tsv]
+  offensive-migrate skip SOURCE [PLAN.tsv]
+  offensive-migrate execute [--apply] [PLAN.tsv]
+  offensive-migrate rollback [TRANSACTION_ID]
+  offensive-migrate verify [TRANSACTION_ID]
+  offensive-migrate status
+  offensive-migrate reset-approvals
+
+Actions:
+  move       Move source to an absent destination.
+  merge      Merge directory contents into an existing destination.
+  replace    Replace an existing destination after backing it up.
+  keep       Leave the source at the workspace root.
+  skip       Defer the item.
+
+Safety:
+  execute defaults to dry-run. Use --apply to perform approved actions.
+  Every applied transaction records a manifest and rollback journal.
+USAGE
+}
+
+log() { printf '[offensive-migrate] %s\n' "$*"; }
+warn() { printf '[offensive-migrate] WARNING: %s\n' "$*" >&2; }
+die() { printf '[offensive-migrate] ERROR: %s\n' "$*" >&2; exit 1; }
+
+require() { command -v "$1" >/dev/null 2>&1 || die "Missing command: $1"; }
+for cmd in awk find sort cut cp mv rsync flock sha256sum date; do require "$cmd"; done
+
+mkdir -p "$STATE_DIR" "$LOG_DIR"
+touch "$LOCK_FILE"
+exec 9>"$LOCK_FILE"
+flock -n 9 || die "Another migration-manager process is running"
+
+latest_plan() {
+  find -L "$REPORT_DIR" -maxdepth 1 -type f -name 'migration-plan-*.tsv' -printf '%T@ %p\n' 2>/dev/null |
+    sort -nr | cut -d' ' -f2- |
+    while IFS= read -r candidate; do
+      [[ -f "$candidate" ]] || continue
+      rows="$(awk 'END {print NR-1}' "$candidate")"
+      if [[ "$rows" =~ ^[0-9]+$ ]] && (( rows > 0 )); then
+        printf '%s\n' "$candidate"
+        break
+      fi
+    done
+}
+
+resolve_plan() {
+  local supplied="${1:-}"
+  if [[ -n "$supplied" ]]; then
+    [[ -f "$supplied" ]] || die "Plan not found: $supplied"
+    printf '%s\n' "$supplied"
+  else
+    local selected
+    selected="$(latest_plan)"
+    [[ -n "$selected" ]] || die "No populated migration plan found in $REPORT_DIR"
+    printf '%s\n' "$selected"
+  fi
+}
+
+plan_id() { sha256sum "$1" | awk '{print substr($1,1,16)}'; }
+
+ensure_approval_header() {
+  if [[ ! -s "$APPROVAL_FILE" ]]; then
+    printf 'plan_id\tsource_name\taction\tapproved_at\n' > "$APPROVAL_FILE"
+  fi
+}
+
+get_approval() {
+  local pid="$1" source="$2"
+  ensure_approval_header
+  awk -F '\t' -v p="$pid" -v s="$source" '
+    NR>1 && $1==p && $2==s { action=$3 }
+    END { if (action != "") print action }
+  ' "$APPROVAL_FILE"
+}
+
+set_approval() {
+  local pid="$1" source="$2" action="$3"
+  ensure_approval_header
+  local tmp
+  tmp="$(mktemp "$STATE_DIR/approvals.XXXXXX")"
+  awk -F '\t' -v OFS='\t' -v p="$pid" -v s="$source" '
+    NR==1 || !($1==p && $2==s)
+  ' "$APPROVAL_FILE" > "$tmp"
+  printf '%s\t%s\t%s\t%s\n' "$pid" "$source" "$action" "$(date --iso-8601=seconds)" >> "$tmp"
+  mv -f -- "$tmp" "$APPROVAL_FILE"
+}
+
+lookup_row() {
+  local plan="$1" source="$2"
+  awk -F '\t' -v s="$source" 'NR>1 && $1==s {print; found=1} END{exit found?0:1}' "$plan"
+}
+
+cmd_plan() {
+  local plan pid
+  plan="$(resolve_plan "${1:-}")"
+  pid="$(plan_id "$plan")"
+  printf 'Plan:    %s\n' "$plan"
+  printf 'Plan ID: %s\n' "$pid"
+  printf 'Rows:    %s\n\n' "$(awk 'END{print NR-1}' "$plan")"
+  awk -F '\t' 'NR>1 {c[$5]++} END{for(k in c) printf "%-24s %d\n", k, c[k]}' "$plan" | sort
+}
+
+cmd_review() {
+  local plan pid
+  plan="$(resolve_plan "${1:-}")"
+  pid="$(plan_id "$plan")"
+  ensure_approval_header
+  printf 'Plan: %s\n\n' "$plan"
+  printf '%-34s %-20s %-12s %s\n' 'SOURCE' 'PLAN STATUS' 'APPROVAL' 'DESTINATION'
+  printf '%-34s %-20s %-12s %s\n' '------' '-----------' '--------' '-----------'
+  while IFS=$'\t' read -r source type current destination status size notes; do
+    [[ "$source" == "source_name" ]] && continue
+    approval="$(get_approval "$pid" "$source")"
+    printf '%-34s %-20s %-12s %s\n' "$source" "$status" "${approval:--}" "$destination"
+  done < "$plan"
+}
+
+cmd_approve() {
+  local source="${1:-}" action="${2:-}" plan pid row status destination
+  [[ -n "$source" && -n "$action" ]] || die "Usage: approve SOURCE ACTION [PLAN.tsv]"
+  case "$action" in move|merge|replace|keep|skip) ;; *) die "Invalid action: $action" ;; esac
+  plan="$(resolve_plan "${3:-}")"
+  pid="$(plan_id "$plan")"
+  row="$(lookup_row "$plan" "$source")" || die "Source is not present in plan: $source"
+  IFS=$'\t' read -r _ _ _ destination status _ _ <<< "$row"
+  case "$action" in
+    move) [[ ! -e "$destination" ]] || die "Destination exists; use merge, replace, keep, or skip" ;;
+    merge) [[ -d "$destination" ]] || die "Merge requires an existing destination directory" ;;
+    replace) [[ -e "$destination" ]] || warn "Destination does not exist; move is simpler" ;;
+  esac
+  set_approval "$pid" "$source" "$action"
+  log "Approved: $source -> $action"
+}
+
+cmd_approve_all_proposed() {
+  local plan pid count=0
+  plan="$(resolve_plan "${1:-}")"
+  pid="$(plan_id "$plan")"
+  while IFS=$'\t' read -r source type current destination status size notes; do
+    [[ "$source" == "source_name" ]] && continue
+    if [[ "$status" == "proposed" && ! -e "$destination" ]]; then
+      set_approval "$pid" "$source" move
+      ((count+=1))
+    fi
+  done < "$plan"
+  log "Approved $count proposed move(s)."
+}
+
+cmd_skip() { cmd_approve "${1:-}" skip "${2:-}"; }
+
+record_manifest_header() {
+  local file="$1"
+  printf 'source_name\taction\tsource\tdestination\tbackup\tresult\n' > "$file"
+}
+
+perform_move() {
+  local source_name="$1" source="$2" destination="$3" manifest="$4"
+  mkdir -p "$(dirname "$destination")"
+  mv -- "$source" "$destination"
+  printf '%s\tmove\t%s\t%s\t\tmoved\n' "$source_name" "$source" "$destination" >> "$manifest"
+}
+
+perform_merge() {
+  local source_name="$1" source="$2" destination="$3" backup="$4" manifest="$5"
+  [[ -d "$source" && -d "$destination" ]] || die "Merge requires two directories: $source -> $destination"
+  mkdir -p "$backup"
+  rsync -aHAX --numeric-ids --delete "$destination/" "$backup/"
+  rsync -aHAX --numeric-ids "$source/" "$destination/"
+  mv -- "$source" "${source}.migrated"
+  printf '%s\tmerge\t%s\t%s\t%s\tmerged\n' "$source_name" "$source" "$destination" "$backup" >> "$manifest"
+}
+
+perform_replace() {
+  local source_name="$1" source="$2" destination="$3" backup="$4" manifest="$5"
+  mkdir -p "$(dirname "$destination")" "$(dirname "$backup")"
+  if [[ -e "$destination" ]]; then mv -- "$destination" "$backup"; fi
+  mv -- "$source" "$destination"
+  printf '%s\treplace\t%s\t%s\t%s\treplaced\n' "$source_name" "$source" "$destination" "$backup" >> "$manifest"
+}
+
+cmd_execute() {
+  local apply=0 supplied=""
+  while (($#)); do
+    case "$1" in
+      --apply) apply=1 ;;
+      -h|--help) usage; return 0 ;;
+      *) supplied="$1" ;;
+    esac
+    shift
+  done
+  local plan pid tx txdir manifest log_file approved_count=0
+  plan="$(resolve_plan "$supplied")"
+  pid="$(plan_id "$plan")"
+  tx="$(date '+%Y%m%d-%H%M%S')-$pid"
+  txdir="$STATE_DIR/transactions/$tx"
+  manifest="$txdir/manifest.tsv"
+  log_file="$LOG_DIR/$tx.log"
+  mkdir -p "$txdir/backups"
+  cp -a -- "$plan" "$txdir/plan.tsv"
+  record_manifest_header "$manifest"
+
+  printf '%s\n' "$tx" > "$ACTIVE_FILE"
+  trap 'rm -f "$ACTIVE_FILE"' EXIT
+
+  while IFS=$'\t' read -r source_name type source destination status size notes; do
+    [[ "$source_name" == "source_name" ]] && continue
+    action="$(get_approval "$pid" "$source_name")"
+    [[ -n "$action" ]] || continue
+    ((approved_count+=1))
+    printf '[%s] %s: %s -> %s\n' "$action" "$source_name" "$source" "$destination" | tee -a "$log_file"
+    if (( ! apply )); then continue; fi
+    case "$action" in
+      move)
+        [[ -e "$source" ]] || die "Source disappeared: $source"
+        [[ ! -e "$destination" ]] || die "Destination appeared: $destination"
+        perform_move "$source_name" "$source" "$destination" "$manifest"
+        ;;
+      merge)
+        perform_merge "$source_name" "$source" "$destination" "$txdir/backups/$source_name" "$manifest"
+        ;;
+      replace)
+        perform_replace "$source_name" "$source" "$destination" "$txdir/backups/$source_name" "$manifest"
+        ;;
+      keep|skip)
+        printf '%s\t%s\t%s\t%s\t\tunchanged\n' "$source_name" "$action" "$source" "$destination" >> "$manifest"
+        ;;
+    esac
+  done < "$plan"
+
+  (( approved_count > 0 )) || die "No approvals exist for this plan"
+  if (( apply )); then
+    printf '%s\n' "$tx" > "$STATE_DIR/last-transaction"
+    log "Applied transaction: $tx"
+    log "Manifest: $manifest"
+  else
+    rm -rf -- "$txdir"
+    log "Dry-run complete. Re-run with --apply to execute $approved_count approved action(s)."
+  fi
+}
+
+cmd_rollback() {
+  local tx="${1:-}"
+  if [[ -z "$tx" && -f "$STATE_DIR/last-transaction" ]]; then tx="$(<"$STATE_DIR/last-transaction")"; fi
+  [[ -n "$tx" ]] || die "No transaction specified and no last transaction recorded"
+  local txdir="$STATE_DIR/transactions/$tx" manifest="$STATE_DIR/transactions/$tx/manifest.tsv"
+  [[ -f "$manifest" ]] || die "Transaction manifest not found: $manifest"
+  tac "$manifest" | while IFS=$'\t' read -r source_name action source destination backup result; do
+    [[ "$source_name" == "source_name" || -z "$source_name" ]] && continue
+    case "$action" in
+      move)
+        [[ -e "$destination" ]] && { mkdir -p "$(dirname "$source")"; mv -- "$destination" "$source"; }
+        ;;
+      merge)
+        if [[ -d "${source}.migrated" ]]; then mv -- "${source}.migrated" "$source"; fi
+        if [[ -d "$backup" ]]; then
+          rsync -aHAX --numeric-ids --delete "$backup/" "$destination/"
+        fi
+        ;;
+      replace)
+        [[ -e "$destination" ]] && { mkdir -p "$(dirname "$source")"; mv -- "$destination" "$source"; }
+        [[ -e "$backup" ]] && mv -- "$backup" "$destination"
+        ;;
+    esac
+  done
+  printf '%s\n' "$(date --iso-8601=seconds)" > "$txdir/rolled-back-at"
+  log "Rolled back transaction: $tx"
+}
+
+cmd_verify() {
+  local tx="${1:-}"
+  if [[ -z "$tx" && -f "$STATE_DIR/last-transaction" ]]; then tx="$(<"$STATE_DIR/last-transaction")"; fi
+  [[ -n "$tx" ]] || die "No transaction specified and no last transaction recorded"
+  local manifest="$STATE_DIR/transactions/$tx/manifest.tsv" failures=0
+  [[ -f "$manifest" ]] || die "Manifest not found: $manifest"
+  while IFS=$'\t' read -r source_name action source destination backup result; do
+    [[ "$source_name" == "source_name" ]] && continue
+    case "$action" in
+      move|replace)
+        if [[ -e "$destination" && ! -e "$source" ]]; then log "PASS $source_name"; else warn "FAIL $source_name"; ((failures+=1)); fi
+        ;;
+      merge)
+        if [[ -d "$destination" && -e "${source}.migrated" ]]; then log "PASS $source_name"; else warn "FAIL $source_name"; ((failures+=1)); fi
+        ;;
+      keep|skip) log "PASS $source_name unchanged" ;;
+    esac
+  done < "$manifest"
+  (( failures == 0 )) || die "$failures verification failure(s)"
+  log "Transaction verified: $tx"
+}
+
+cmd_status() {
+  printf 'Root:       %s\n' "$ROOT"
+  printf 'State:      %s\n' "$STATE_DIR"
+  printf 'Latest plan:%s\n' " $(latest_plan || true)"
+  if [[ -f "$STATE_DIR/last-transaction" ]]; then printf 'Last tx:    %s\n' "$(<"$STATE_DIR/last-transaction")"; else printf 'Last tx:    none\n'; fi
+  if [[ -f "$ACTIVE_FILE" ]]; then printf 'Active tx:  %s\n' "$(<"$ACTIVE_FILE")"; else printf 'Active tx:  none\n'; fi
+  ensure_approval_header
+  printf 'Approvals:  %s\n' "$(awk 'END{print NR-1}' "$APPROVAL_FILE")"
+}
+
+cmd_reset_approvals() {
+  rm -f -- "$APPROVAL_FILE"
+  ensure_approval_header
+  log "Approvals reset."
+}
+
+case "${1:-}" in
+  plan) shift; cmd_plan "$@" ;;
+  review) shift; cmd_review "$@" ;;
+  approve) shift; cmd_approve "$@" ;;
+  approve-all-proposed) shift; cmd_approve_all_proposed "$@" ;;
+  skip) shift; cmd_skip "$@" ;;
+  execute) shift; cmd_execute "$@" ;;
+  rollback) shift; cmd_rollback "$@" ;;
+  verify) shift; cmd_verify "$@" ;;
+  status) shift; cmd_status "$@" ;;
+  reset-approvals) shift; cmd_reset_approvals "$@" ;;
+  -h|--help|help|'') usage ;;
+  *) die "Unknown command: $1" ;;
+esac

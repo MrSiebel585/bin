@@ -1,0 +1,203 @@
+#!/usr/bin/env zsh
+set -u
+
+ROOT="/opt/offensive"
+STATE="$ROOT/state"
+
+header() {
+  clear
+  print
+  print "============================================================"
+  print "                  OFFENSIVE CONSOLE"
+  print "============================================================"
+  print " Root: $ROOT"
+  print " Host: $(hostname)"
+  print " Time: $(date '+%Y-%m-%d %H:%M:%S')"
+  print "============================================================"
+}
+
+status() {
+  print
+  print "[+] DIRECTORY STATUS"
+  for d in bin scripts tools recon osint scans captures logs reports wordlists packages docs state; do
+    [[ -d "$ROOT/$d" ]] || continue
+    count=$(find "$ROOT/$d" -mindepth 1 2>/dev/null | wc -l)
+    printf "  %-12s %s\n" "$d" "$count"
+  done
+}
+
+recent() {
+  print
+  print "[+] RECENT OUTPUT"
+  find "$ROOT" -type f \
+    \( -name '*.log' -o -name '*.txt' -o -name '*.md' -o -name '*.xml' -o -name '*.csv' \) \
+    -printf '%T@ %TY-%Tm-%Td %TH:%TM  %p\n' 2>/dev/null |
+    sort -nr |
+    head -30 |
+    cut -d' ' -f2-
+}
+
+logs() {
+  print
+  print "[+] LOG FILES"
+  find "$ROOT" -type f \
+    \( -name '*.log' -o -name '*.eci' -o -name '*.ecp' \) \
+    -printf '%TY-%Tm-%Td %TH:%TM  %p\n' 2>/dev/null |
+    sort -r |
+    head -50
+}
+
+analyze() {
+  mkdir -p "$STATE"
+
+  REPORT="$STATE/analysis-$(date +%Y%m%d-%H%M%S).txt"
+
+  {
+    print "OFFENSIVE RECURSIVE ANALYSIS"
+    print "Generated: $(date)"
+    print "Root: $ROOT"
+    print
+
+    print "=== FILE COUNTS ==="
+    find "$ROOT" -type f 2>/dev/null |
+      awk -F. '
+      NF>1 {ext=tolower($NF); count[ext]++}
+      END {for (e in count) print e, count[e]}' |
+      sort
+
+    print
+    print "=== ERROR / FAILURE SIGNALS ==="
+    grep -RniE \
+      'error|failed|failure|fatal|critical|timeout|denied|refused|unreachable' \
+      "$ROOT/logs" "$ROOT/reports" "$ROOT/scans" "$ROOT/recon" \
+      2>/dev/null |
+      head -200 || true
+
+    print
+    print "=== HIGH-SIGNAL SECURITY TERMS ==="
+    grep -RniE \
+      'vulnerab|critical|high risk|open port|credential|password|token|secret|CVE-[0-9]{4}-[0-9]+' \
+      "$ROOT/logs" "$ROOT/reports" "$ROOT/scans" "$ROOT/recon" \
+      2>/dev/null |
+      head -200 || true
+
+    print
+    print "=== RECENT FILES ==="
+    find "$ROOT" -type f \
+      -printf '%T@ %TY-%Tm-%Td %TH:%TM %p\n' 2>/dev/null |
+      sort -nr |
+      head -100 |
+      cut -d' ' -f2-
+  } > "$REPORT"
+
+  print "[+] Analysis written to:"
+  print "    $REPORT"
+}
+
+search_all() {
+  local q="${1:-}"
+
+  if [[ -z "$q" ]]; then
+    print -n "Search term: "
+    read q
+  fi
+
+  grep -RniI -- "$q" "$ROOT" 2>/dev/null | head -200
+}
+
+launchers() {
+  print
+  print "[+] EXECUTABLES"
+  find "$ROOT/bin" "$ROOT/tools" "$ROOT/scripts" \
+    -type f -perm -u+x 2>/dev/null |
+    sort
+}
+
+doctor() {
+  print
+  print "[+] OFFENSIVE DOCTOR"
+
+  [[ -d "$ROOT" ]] && print "[OK] root exists" || print "[FAIL] missing root"
+  [[ -d "$ROOT/bin" ]] && print "[OK] bin exists" || print "[FAIL] missing bin"
+  [[ -w "$STATE" ]] && print "[OK] state writable" || print "[WARN] state not writable"
+
+  print
+  print "[+] Broken symlinks:"
+  find "$HOME" -maxdepth 1 -xtype l -print 2>/dev/null
+
+  print
+  print "[+] Executable count:"
+  find "$ROOT" -type f -perm -u+x 2>/dev/null | wc -l
+}
+
+menu() {
+  while true; do
+    header
+
+    print "  1) Status"
+    print "  2) Recent output"
+    print "  3) Logs"
+    print "  4) Analyze all output"
+    print "  5) Search"
+    print "  6) Executables"
+    print "  7) Doctor"
+    print "  8) Open /opt/offensive"
+    print "  q) Quit"
+    print
+
+    print -n "offensive> "
+    read choice
+
+    case "$choice" in
+      1) status ;;
+      2) recent ;;
+      3) logs ;;
+      4) analyze ;;
+      5) search_all ;;
+      6) launchers ;;
+      7) doctor ;;
+      8) cd "$ROOT"; exec "${SHELL:-/usr/bin/zsh}" ;;
+      q|Q) exit 0 ;;
+      *) print "Unknown option" ;;
+    esac
+
+    print
+    print -n "Press ENTER..."
+    read
+  done
+}
+
+# OFFENSIVECTL_DYNAMIC_PLUGIN_ROUTER
+SUBCOMMAND="${1:-}"
+
+if [[ -n "$SUBCOMMAND" ]]; then
+    PLUGIN="/opt/offensive/bin/offensivectl-${SUBCOMMAND}"
+
+    if [[ -x "$PLUGIN" ]]; then
+        shift
+        exec "$PLUGIN" "$@"
+    fi
+fi
+
+case "${1:-menu}" in
+  status) status ;;
+  recent) recent ;;
+  logs) logs ;;
+  analyze) analyze ;;
+  search) shift; search_all "$@" ;;
+  executables|bin) launchers ;;
+  doctor) doctor ;;
+  menu) menu ;;
+  *)
+    print "Usage:"
+    print "  offensivectl"
+    print "  offensivectl status"
+    print "  offensivectl recent"
+    print "  offensivectl logs"
+    print "  offensivectl analyze"
+    print "  offensivectl search TERM"
+    print "  offensivectl executables"
+    print "  offensivectl doctor"
+    exit 1
+    ;;
+esac

@@ -1,0 +1,54 @@
+#!/usr/bin/env bash
+set -Eeuo pipefail
+
+echo "Offensive Infrastructure Health"
+echo "==============================="
+echo
+
+echo "[Paths]"
+for p in \
+    /opt/offensive \
+    /etc/offensive \
+    /var/lib/offensive \
+    /var/log/offensive \
+    /var/cache/offensive \
+    /srv/offensive \
+    /run/offensive
+do
+    if [[ -e "$p" ]]; then
+        echo "[OK] $p"
+    else
+        echo "[MISSING] $p"
+    fi
+done
+
+echo
+echo "[Control Plane]"
+if command -v offensivectl >/dev/null 2>&1; then
+    echo "[OK] offensivectl -> $(readlink -f "$(command -v offensivectl)")"
+    offensivectl doctor || true
+else
+    echo "[MISSING] offensivectl"
+fi
+
+echo
+echo "[LMS]"
+if command -v lms >/dev/null 2>&1; then
+    echo "[OK] lms -> $(command -v lms)"
+    lms server status || true
+    lms ps || true
+else
+    echo "[MISSING] lms"
+fi
+
+echo
+echo "[Python]"
+if [[ -x /opt/offensive/venv/bin/python ]]; then
+    /opt/offensive/venv/bin/python --version
+else
+    echo "[MISSING/BROKEN] /opt/offensive/venv"
+fi
+
+echo
+echo "[Disk]"
+df -h /opt/offensive /var/lib/offensive /var/log/offensive 2>/dev/null || true

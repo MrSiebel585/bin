@@ -1,0 +1,786 @@
+#!/usr/bin/env python3
+"""
+public_records_engine.py
+
+A lawful public-records / public-data collection framework.
+
+What it does:
+- Uses official APIs first.
+- Supports Data.gov CKAN, Federal Register, CourtListener, SEC EDGAR,
+  FEC, NPPES, Census, OpenStates, Socrata, FCC Area API, and generic safe scraping.
+- Respects robots.txt for scraping.
+- Adds rate limiting.
+- Exports JSONL and CSV.
+- Avoids login bypass, CAPTCHA bypass, paywall bypass, or hidden endpoint abuse.
+
+Important:
+- Do not use this for stalking, harassment, doxxing, credential harvesting,
+  FCRA-regulated decisions without compliance, or bulk profiling of private people.
+- PACER, FOIA.gov, FEC, OpenStates, FCC ECFS, and some Socrata portals may require API keys.
+"""
+
+from __future__ import annotations
+
+import argparse
+import csv
+import json
+import os
+import re
+import sys
+import time
+import urllib.parse
+import urllib.robotparser
+from dataclasses import dataclass, field
+from typing import Any, Dict, Iterable, List, Optional
+
+import requests
+from bs4 import BeautifulSoup
+from dotenv import load_dotenv
+from tenacity import retry, stop_after_attempt, wait_exponential
+
+
+load_dotenv()
+
+
+DEFAULT_USER_AGENT = os.getenv(
+    "PUBLIC_RECORDS_USER_AGENT",
+    "PublicRecordsResearchBot/1.0 contact=you@example.com",
+)
+
+
+# -----------------------------
+# Core HTTP Client
+# -----------------------------
+
+
+@dataclass
+class HTTPClient:
+    user_agent: str = DEFAULT_USER_AGENT
+    timeout: int = 30
+    delay_seconds: float = 1.0
+    session: requests.Session = field(default_factory=requests.Session)
+
+    def __post_init__(self) -> None:
+        self.session.headers.update({
+            "User-Agent": self.user_agent,
+            "Accept": "application/json,text/html;q=0.9,*/*;q=0.8",
+        })
+
+    def _sleep(self) -> None:
+        if self.delay_seconds > 0:
+            time.sleep(self.delay_seconds)
+
+    @retry(
+        wait=wait_exponential(multiplier=1, min=1, max=20), stop=stop_after_attempt(3)
+    )
+    def get(self, url: str, **kwargs: Any) -> requests.Response:
+        self._sleep()
+        response = self.session.get(url, timeout=self.timeout, **kwargs)
+        response.raise_for_status()
+        return response
+
+    @retry(
+        wait=wait_exponential(multiplier=1, min=1, max=20), stop=stop_after_attempt(3)
+    )
+    def post(self, url: str, **kwargs: Any) -> requests.Response:
+        self._sleep()
+        response = self.session.post(url, timeout=self.timeout, **kwargs)
+        response.raise_for_status()
+        return response
+
+
+# -----------------------------
+# Utility functions
+# -----------------------------
+
+
+def compact_record(record: Dict[str, Any]) -> Dict[str, Any]:
+    """Remove empty values for cleaner output."""
+    return {k: v for k, v in record.items() if v not in (None, "", [], {})}
+
+
+def write_jsonl(path: str, records: Iterable[Dict[str, Any]]) -> None:
+    with open(path, "w", encoding="utf-8") as f:
+        for record in records:
+            f.write(json.dumps(record, ensure_ascii=False) + "\n")
+
+
+def write_csv(path: str, records: List[Dict[str, Any]]) -> None:
+    if not records:
+        with open(path, "w", encoding="utf-8") as f:
+            f.write("")
+        return
+
+    fieldnames = sorted({key for record in records for key in record.keys()})
+    with open(path, "w", encoding="utf-8", newline="") as f:
+        writer = csv.DictWriter(f, fieldnames=fieldnames)
+        writer.writeheader()
+        for record in records:
+            writer.writerow(record)
+
+
+def print_json(data: Any) -> None:
+    print(json.dumps(data, indent=2, ensure_ascii=False))
+
+
+# -----------------------------
+# API Connectors
+# -----------------------------
+
+
+class PublicRecordsEngine:
+    def __init__(self, client: Optional[HTTPClient] = None) -> None:
+        self.client = client or HTTPClient()
+
+        self.keys = {
+            "DATA_GOV": os.getenv("DATA_GOV_API_KEY", "DEMO_KEY"),
+            "FEC": os.getenv("FEC_API_KEY", ""),
+            "OPENSTATES": os.getenv("OPENSTATES_API_KEY", ""),
+            "FOIA": os.getenv("FOIA_API_KEY", ""),
+            "FCC_ECFS": os.getenv("FCC_ECFS_API_KEY", ""),
+            "SOCRATA_APP_TOKEN": os.getenv("SOCRATA_APP_TOKEN", ""),
+            "PACER_USERNAME": os.getenv("PACER_USERNAME", ""),
+            "PACER_PASSWORD": os.getenv("PACER_PASSWORD", ""),
+        }
+
+    # 1. Data.gov CKAN metadata search
+    def search_datagov(self, query: str, rows: int = 10) -> List[Dict[str, Any]]:
+        url = "https://catalog.data.gov/api/3/action/package_search"
+        params = {"q": query, "rows": rows}
+        data = self.client.get(url, params=params).json()
+
+        results = []
+        for item in data.get("result", {}).get("results", []):
+            results.append(
+                compact_record({
+                    "source": "data.gov",
+                    "title": item.get("title"),
+                    "name": item.get("name"),
+                    "organization": item.get("organization", {}).get("title"),
+                    "notes": item.get("notes"),
+                    "url": item.get("url"),
+                    "metadata_created": item.get("metadata_created"),
+                    "metadata_modified": item.get("metadata_modified"),
+                })
+            )
+        return results
+
+    # 2. Federal Register
+    def search_federal_register(
+        self,
+        query: str,
+        per_page: int = 20,
+        order: str = "newest",
+    ) -> List[Dict[str, Any]]:
+        url = "https://www.federalregister.gov/api/v1/documents.json"
+        params = {
+            "conditions[term]": query,
+            "per_page": per_page,
+            "order": order,
+        }
+        data = self.client.get(url, params=params).json()
+
+        results = []
+        for item in data.get("results", []):
+            results.append(
+                compact_record({
+                    "source": "federal_register",
+                    "title": item.get("title"),
+                    "type": item.get("type"),
+                    "document_number": item.get("document_number"),
+                    "publication_date": item.get("publication_date"),
+                    "agency_names": item.get("agency_names"),
+                    "html_url": item.get("html_url"),
+                    "pdf_url": item.get("pdf_url"),
+                    "abstract": item.get("abstract"),
+                })
+            )
+        return results
+
+    # 3. CourtListener
+    def search_courtlistener(
+        self, query: str, page_size: int = 20
+    ) -> List[Dict[str, Any]]:
+        url = "https://www.courtlistener.com/api/rest/v4/search/"
+        params = {
+            "q": query,
+            "type": "o",
+            "page_size": page_size,
+        }
+        data = self.client.get(url, params=params).json()
+
+        results = []
+        for item in data.get("results", []):
+            results.append(
+                compact_record({
+                    "source": "courtlistener",
+                    "case_name": item.get("caseName"),
+                    "court": item.get("court"),
+                    "date_filed": item.get("dateFiled"),
+                    "docket_number": item.get("docketNumber"),
+                    "absolute_url": urllib.parse.urljoin(
+                        "https://www.courtlistener.com",
+                        item.get("absolute_url") or item.get("absoluteUrl") or "",
+                    ),
+                    "snippet": BeautifulSoup(
+                        item.get("snippet", ""), "html.parser"
+                    ).get_text(" ", strip=True),
+                })
+            )
+        return results
+
+    # 4. SEC EDGAR company submissions by CIK
+    def sec_company_submissions(self, cik: str) -> Dict[str, Any]:
+        cik_padded = str(cik).strip().lstrip("0").zfill(10)
+        url = f"https://data.sec.gov/submissions/CIK{cik_padded}.json"
+
+        response = self.client.get(url)
+        data = response.json()
+
+        recent = data.get("filings", {}).get("recent", {})
+        filings = []
+        forms = recent.get("form", [])
+        accession_numbers = recent.get("accessionNumber", [])
+        filing_dates = recent.get("filingDate", [])
+        report_dates = recent.get("reportDate", [])
+        primary_docs = recent.get("primaryDocument", [])
+
+        for i, form in enumerate(forms[:50]):
+            filings.append(
+                compact_record({
+                    "form": form,
+                    "accession_number": accession_numbers[i]
+                    if i < len(accession_numbers)
+                    else None,
+                    "filing_date": filing_dates[i] if i < len(filing_dates) else None,
+                    "report_date": report_dates[i] if i < len(report_dates) else None,
+                    "primary_document": primary_docs[i]
+                    if i < len(primary_docs)
+                    else None,
+                })
+            )
+
+        return compact_record({
+            "source": "sec_edgar",
+            "cik": data.get("cik"),
+            "name": data.get("name"),
+            "tickers": data.get("tickers"),
+            "exchanges": data.get("exchanges"),
+            "sic": data.get("sic"),
+            "sicDescription": data.get("sicDescription"),
+            "filings_recent": filings,
+        })
+
+    # 5. FEC candidate/committee search
+    def search_fec_candidates(
+        self, query: str, per_page: int = 20
+    ) -> List[Dict[str, Any]]:
+        if not self.keys["FEC"]:
+            raise RuntimeError("Missing FEC_API_KEY environment variable.")
+
+        url = "https://api.open.fec.gov/v1/candidates/search/"
+        params = {
+            "q": query,
+            "per_page": per_page,
+            "api_key": self.keys["FEC"],
+        }
+        data = self.client.get(url, params=params).json()
+
+        results = []
+        for item in data.get("results", []):
+            results.append(
+                compact_record({
+                    "source": "fec",
+                    "candidate_id": item.get("candidate_id"),
+                    "name": item.get("name"),
+                    "party": item.get("party"),
+                    "office": item.get("office"),
+                    "state": item.get("state"),
+                    "district": item.get("district"),
+                    "active_through": item.get("active_through"),
+                })
+            )
+        return results
+
+    # 6. NPPES / NPI Registry
+    def search_nppes(
+        self,
+        first_name: Optional[str] = None,
+        last_name: Optional[str] = None,
+        organization_name: Optional[str] = None,
+        city: Optional[str] = None,
+        state: Optional[str] = None,
+        limit: int = 20,
+    ) -> List[Dict[str, Any]]:
+        url = "https://npiregistry.cms.hhs.gov/api/"
+        params = {
+            "version": "2.1",
+            "limit": limit,
+        }
+
+        if first_name:
+            params["first_name"] = first_name
+        if last_name:
+            params["last_name"] = last_name
+        if organization_name:
+            params["organization_name"] = organization_name
+        if city:
+            params["city"] = city
+        if state:
+            params["state"] = state
+
+        data = self.client.get(url, params=params).json()
+
+        results = []
+        for item in data.get("results", []):
+            basic = item.get("basic", {})
+            addresses = item.get("addresses", [])
+            taxonomies = item.get("taxonomies", [])
+
+            results.append(
+                compact_record({
+                    "source": "nppes",
+                    "number": item.get("number"),
+                    "enumeration_type": item.get("enumeration_type"),
+                    "name": " ".join(
+                        filter(
+                            None,
+                            [
+                                basic.get("first_name"),
+                                basic.get("middle_name"),
+                                basic.get("last_name"),
+                                basic.get("organization_name"),
+                            ],
+                        )
+                    ).strip(),
+                    "credential": basic.get("credential"),
+                    "status": basic.get("status"),
+                    "enumeration_date": basic.get("enumeration_date"),
+                    "last_updated": basic.get("last_updated"),
+                    "addresses": addresses,
+                    "taxonomies": taxonomies,
+                })
+            )
+        return results
+
+    # 7. Census API generic query
+    def census_get(
+        self,
+        dataset_path: str,
+        get_fields: str,
+        for_clause: str,
+        in_clause: Optional[str] = None,
+    ) -> List[Dict[str, Any]]:
+        """
+        Example:
+        dataset_path = "2022/acs/acs5/profile"
+        get_fields = "NAME,DP05_0001E"
+        for_clause = "county:*"
+        in_clause = "state:45"
+        """
+        url = f"https://api.census.gov/data/{dataset_path}"
+        params = {
+            "get": get_fields,
+            "for": for_clause,
+        }
+        if in_clause:
+            params["in"] = in_clause
+
+        data = self.client.get(url, params=params).json()
+        if not data or len(data) < 2:
+            return []
+
+        headers = data[0]
+        rows = data[1:]
+
+        results = []
+        for row in rows:
+            results.append(
+                compact_record({
+                    "source": "census",
+                    **dict(zip(headers, row)),
+                })
+            )
+        return results
+
+    # 8. OpenStates people/bills search
+    def search_openstates_bills(
+        self, query: str, jurisdiction: Optional[str] = None, per_page: int = 20
+    ) -> List[Dict[str, Any]]:
+        if not self.keys["OPENSTATES"]:
+            raise RuntimeError("Missing OPENSTATES_API_KEY environment variable.")
+
+        url = "https://v3.openstates.org/bills"
+        params = {
+            "q": query,
+            "per_page": per_page,
+        }
+        if jurisdiction:
+            params["jurisdiction"] = jurisdiction
+
+        headers = {"X-API-KEY": self.keys["OPENSTATES"]}
+        data = self.client.get(url, params=params, headers=headers).json()
+
+        results = []
+        for item in data.get("results", []):
+            results.append(
+                compact_record({
+                    "source": "openstates",
+                    "id": item.get("id"),
+                    "identifier": item.get("identifier"),
+                    "title": item.get("title"),
+                    "classification": item.get("classification"),
+                    "jurisdiction": item.get("jurisdiction", {}).get("name"),
+                    "session": item.get("session"),
+                    "updated_at": item.get("updated_at"),
+                    "openstates_url": item.get("openstates_url"),
+                })
+            )
+        return results
+
+    # 9. Socrata SODA API query
+    def socrata_query(
+        self,
+        domain: str,
+        dataset_id: str,
+        select: str = "*",
+        where: Optional[str] = None,
+        limit: int = 100,
+        order: Optional[str] = None,
+    ) -> List[Dict[str, Any]]:
+        """
+        Example:
+        domain = "data.cityofnewyork.us"
+        dataset_id = "bnx9-e6tj"
+        """
+        url = f"https://{domain}/resource/{dataset_id}.json"
+        params = {
+            "$select": select,
+            "$limit": limit,
+        }
+        if where:
+            params["$where"] = where
+        if order:
+            params["$order"] = order
+
+        headers = {}
+        if self.keys["SOCRATA_APP_TOKEN"]:
+            headers["X-App-Token"] = self.keys["SOCRATA_APP_TOKEN"]
+
+        data = self.client.get(url, params=params, headers=headers).json()
+        if isinstance(data, dict) and data.get("error"):
+            raise RuntimeError(data)
+        return [{"source": "socrata", **row} for row in data]
+
+    # 10. Socrata dataset discovery
+    def socrata_discover(self, query: str, limit: int = 10) -> List[Dict[str, Any]]:
+        url = "https://api.us.socrata.com/api/catalog/v1"
+        params = {
+            "search_context": "data.cityofnewyork.us",
+            "q": query,
+            "limit": limit,
+        }
+        data = self.client.get(url, params=params).json()
+
+        results = []
+        for item in data.get("results", []):
+            resource = item.get("resource", {})
+            metadata = item.get("metadata", {})
+            permalink = item.get("permalink")
+
+            results.append(
+                compact_record({
+                    "source": "socrata_discovery",
+                    "name": resource.get("name"),
+                    "id": resource.get("id"),
+                    "domain": metadata.get("domain"),
+                    "description": resource.get("description"),
+                    "permalink": permalink,
+                    "updatedAt": resource.get("updatedAt"),
+                })
+            )
+        return results
+
+    # 11. FCC Area API
+    def fcc_area_by_coords(self, latitude: float, longitude: float) -> Dict[str, Any]:
+        url = "https://geo.fcc.gov/api/census/block/find"
+        params = {
+            "latitude": latitude,
+            "longitude": longitude,
+            "format": "json",
+        }
+        data = self.client.get(url, params=params).json()
+        return compact_record({
+            "source": "fcc_area",
+            "input_latitude": latitude,
+            "input_longitude": longitude,
+            "block": data.get("Block"),
+            "county": data.get("County"),
+            "state": data.get("State"),
+            "status": data.get("status"),
+            "executionTime": data.get("executionTime"),
+        })
+
+    # 12. FOIA.gov component search placeholder
+    def foia_agency_components(self) -> Dict[str, Any]:
+        """
+        FOIA.gov requires an API key and its Swagger docs may change.
+        This endpoint pattern is intentionally conservative.
+        """
+        if not self.keys["FOIA"]:
+            raise RuntimeError("Missing FOIA_API_KEY environment variable.")
+
+        url = "https://api.foia.gov/api/agency_components"
+        headers = {"X-API-Key": self.keys["FOIA"]}
+        return self.client.get(url, headers=headers).json()
+
+    # 13. Generic safe web scraper
+    def safe_scrape_page(
+        self,
+        url: str,
+        css_selector: Optional[str] = None,
+        max_chars: int = 5000,
+    ) -> Dict[str, Any]:
+        allowed = self._robots_allowed(url)
+        if not allowed:
+            raise RuntimeError(
+                f"robots.txt does not allow scraping this URL for user-agent: {self.client.user_agent}"
+            )
+
+        response = self.client.get(url, headers={"Accept": "text/html,*/*"})
+        content_type = response.headers.get("Content-Type", "")
+        if "text/html" not in content_type:
+            raise RuntimeError(f"Not HTML content: {content_type}")
+
+        soup = BeautifulSoup(response.text, "html.parser")
+
+        for tag in soup(["script", "style", "noscript"]):
+            tag.decompose()
+
+        if css_selector:
+            nodes = soup.select(css_selector)
+            text = "\n".join(node.get_text(" ", strip=True) for node in nodes)
+        else:
+            text = soup.get_text("\n", strip=True)
+
+        text = re.sub(r"\n{3,}", "\n\n", text).strip()
+
+        title = ""
+        if soup.title and soup.title.string:
+            title = soup.title.string.strip()
+
+        return compact_record({
+            "source": "safe_scrape",
+            "url": url,
+            "title": title,
+            "text": text[:max_chars],
+            "truncated": len(text) > max_chars,
+        })
+
+    def _robots_allowed(self, url: str) -> bool:
+        parsed = urllib.parse.urlparse(url)
+        robots_url = f"{parsed.scheme}://{parsed.netloc}/robots.txt"
+
+        rp = urllib.robotparser.RobotFileParser()
+        try:
+            rp.set_url(robots_url)
+            rp.read()
+            return rp.can_fetch(self.client.user_agent, url)
+        except Exception:
+            # Fail closed. If robots cannot be checked, don't scrape.
+            return False
+
+
+# -----------------------------
+# CLI
+# -----------------------------
+
+
+def build_parser() -> argparse.ArgumentParser:
+    parser = argparse.ArgumentParser(
+        description="Public records / public data API and safe scraping tool."
+    )
+
+    parser.add_argument(
+        "--delay", type=float, default=1.0, help="Delay between HTTP requests."
+    )
+    parser.add_argument("--jsonl", help="Write results to JSONL.")
+    parser.add_argument("--csv", help="Write results to CSV.")
+    parser.add_argument("--pretty", action="store_true", help="Pretty-print JSON.")
+
+    sub = parser.add_subparsers(dest="command", required=True)
+
+    p = sub.add_parser("datagov", help="Search Data.gov CKAN metadata.")
+    p.add_argument("query")
+    p.add_argument("--rows", type=int, default=10)
+
+    p = sub.add_parser("federal-register", help="Search Federal Register.")
+    p.add_argument("query")
+    p.add_argument("--per-page", type=int, default=20)
+
+    p = sub.add_parser("courtlistener", help="Search CourtListener opinions.")
+    p.add_argument("query")
+    p.add_argument("--page-size", type=int, default=20)
+
+    p = sub.add_parser("sec-submissions", help="Get SEC company submissions by CIK.")
+    p.add_argument("cik")
+
+    p = sub.add_parser("fec-candidates", help="Search FEC candidates.")
+    p.add_argument("query")
+    p.add_argument("--per-page", type=int, default=20)
+
+    p = sub.add_parser("nppes", help="Search NPPES/NPI Registry.")
+    p.add_argument("--first-name")
+    p.add_argument("--last-name")
+    p.add_argument("--organization-name")
+    p.add_argument("--city")
+    p.add_argument("--state")
+    p.add_argument("--limit", type=int, default=20)
+
+    p = sub.add_parser("census", help="Generic Census API query.")
+    p.add_argument("--dataset", required=True, help="Example: 2022/acs/acs5/profile")
+    p.add_argument(
+        "--get", required=True, dest="get_fields", help="Example: NAME,DP05_0001E"
+    )
+    p.add_argument("--for", required=True, dest="for_clause", help="Example: county:*")
+    p.add_argument("--in", dest="in_clause", help="Example: state:45")
+
+    p = sub.add_parser("openstates-bills", help="Search OpenStates bills.")
+    p.add_argument("query")
+    p.add_argument("--jurisdiction")
+    p.add_argument("--per-page", type=int, default=20)
+
+    p = sub.add_parser("socrata", help="Query a Socrata dataset.")
+    p.add_argument("--domain", required=True, help="Example: data.cityofnewyork.us")
+    p.add_argument("--dataset-id", required=True, help="Example: bnx9-e6tj")
+    p.add_argument("--select", default="*")
+    p.add_argument("--where")
+    p.add_argument("--limit", type=int, default=100)
+    p.add_argument("--order")
+
+    p = sub.add_parser("socrata-discover", help="Search Socrata catalog.")
+    p.add_argument("query")
+    p.add_argument("--limit", type=int, default=10)
+
+    p = sub.add_parser("fcc-area", help="FCC Census block lookup by coordinates.")
+    p.add_argument("--lat", type=float, required=True)
+    p.add_argument("--lon", type=float, required=True)
+
+    p = sub.add_parser("foia-components", help="Fetch FOIA.gov agency components.")
+
+    p = sub.add_parser(
+        "scrape", help="Safely scrape one public page if robots.txt allows it."
+    )
+    p.add_argument("url")
+    p.add_argument("--selector", help="Optional CSS selector.")
+    p.add_argument("--max-chars", type=int, default=5000)
+
+    return parser
+
+
+def main() -> int:
+    parser = build_parser()
+    args = parser.parse_args()
+
+    client = HTTPClient(delay_seconds=args.delay)
+    engine = PublicRecordsEngine(client=client)
+
+    try:
+        if args.command == "datagov":
+            records = engine.search_datagov(args.query, rows=args.rows)
+
+        elif args.command == "federal-register":
+            records = engine.search_federal_register(args.query, per_page=args.per_page)
+
+        elif args.command == "courtlistener":
+            records = engine.search_courtlistener(args.query, page_size=args.page_size)
+
+        elif args.command == "sec-submissions":
+            records = engine.sec_company_submissions(args.cik)
+
+        elif args.command == "fec-candidates":
+            records = engine.search_fec_candidates(args.query, per_page=args.per_page)
+
+        elif args.command == "nppes":
+            records = engine.search_nppes(
+                first_name=args.first_name,
+                last_name=args.last_name,
+                organization_name=args.organization_name,
+                city=args.city,
+                state=args.state,
+                limit=args.limit,
+            )
+
+        elif args.command == "census":
+            records = engine.census_get(
+                dataset_path=args.dataset,
+                get_fields=args.get_fields,
+                for_clause=args.for_clause,
+                in_clause=args.in_clause,
+            )
+
+        elif args.command == "openstates-bills":
+            records = engine.search_openstates_bills(
+                args.query, jurisdiction=args.jurisdiction, per_page=args.per_page
+            )
+
+        elif args.command == "socrata":
+            records = engine.socrata_query(
+                domain=args.domain,
+                dataset_id=args.dataset_id,
+                select=args.select,
+                where=args.where,
+                limit=args.limit,
+                order=args.order,
+            )
+
+        elif args.command == "socrata-discover":
+            records = engine.socrata_discover(args.query, limit=args.limit)
+
+        elif args.command == "fcc-area":
+            records = engine.fcc_area_by_coords(latitude=args.lat, longitude=args.lon)
+
+        elif args.command == "foia-components":
+            records = engine.foia_agency_components()
+
+        elif args.command == "scrape":
+            records = engine.safe_scrape_page(
+                args.url,
+                css_selector=args.selector,
+                max_chars=args.max_chars,
+            )
+
+        else:
+            raise RuntimeError(f"Unknown command: {args.command}")
+
+    except Exception as e:
+        print(f"Error: {e}", file=sys.stderr)
+        return 1
+
+    # Output routing
+    if args.jsonl:
+        # Support single-record dicts by wrapping.
+        if isinstance(records, dict):
+            write_jsonl(args.jsonl, [records])
+        else:
+            write_jsonl(args.jsonl, records)
+
+    if args.csv:
+        # CSV expects list[dict].
+        if isinstance(records, dict):
+            write_csv(args.csv, [records])
+        else:
+            write_csv(args.csv, records)
+
+    if not args.jsonl and not args.csv:
+        if args.pretty:
+            print_json(records)
+        else:
+            # Compact default
+            print(json.dumps(records, ensure_ascii=False))
+
+    return 0
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())

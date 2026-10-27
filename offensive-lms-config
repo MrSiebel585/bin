@@ -1,0 +1,11 @@
+#!/usr/bin/env bash
+set -Eeuo pipefail
+
+mkdir -p /opt/omniscient/config /opt/omniscient/scripts /opt/omniscient/logs
+
+cat > /opt/omniscient/config/lms-models.txt <<EOF
+mistralai/mistral-7b-instruct-v0.3
+text-embedding-nomic-embed-text-v1.5
+EOF
+
+echo "Wrote /opt/omniscient/config/lms-models.txt"
